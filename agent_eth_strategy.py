@@ -90,6 +90,12 @@ def build_buy_proposal(
     if change_5m >= settings.dump_threshold_pct:
         return None
 
+    # "Ít lệnh - chất lượng": yêu cầu dump lan sang khung 15m
+    # Nếu chỉ dump 5m nhưng 15m không dump đủ sâu, bỏ tín hiệu.
+    change_15m = mkt.changes_15m.get(symbol_key)
+    if change_15m is None or change_15m > settings.dump_threshold_pct:
+        return None
+
     sol_change = change_5m
     btc_change = mkt.changes_5m.get("BTCUSDT")
     solbtc_change = mkt.changes_5m.get("SOLBTC")
@@ -110,17 +116,9 @@ def build_buy_proposal(
         if atr_5m <= 0:
             return None
 
-    change = change_5m
     c0 = settings.initial_capital_usdt
-    if -0.5 <= change < -0.2:
-        stake_pct = 0.15
-    elif -1.0 <= change < -0.5:
-        stake_pct = 0.25
-    elif change < -1.0:
-        stake_pct = 0.30
-    else:
-        return None
-
+    # Mỗi lệnh dùng cố định 70% vốn (theo yêu cầu "ít lệnh - chất lượng").
+    stake_pct = 0.70
     size_usdt = stake_pct * c0
     size_coin = size_usdt / price_now
 
