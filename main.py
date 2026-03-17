@@ -31,13 +31,20 @@ logging.basicConfig(
 logger = logging.getLogger("agent_eth")
 
 
-def load_config_poll_interval(default_seconds: int = 30) -> int:
+def load_config() -> Dict:
     cfg_path = Path("config.yaml")
     if not cfg_path.exists():
-        return default_seconds
+        return {}
     try:
-        raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
-        strategy = raw.get("strategy") or {}
+        return yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+
+
+def load_config_poll_interval(default_seconds: int = 30) -> int:
+    raw = load_config()
+    strategy = raw.get("strategy") or {}
+    try:
         return int(strategy.get("poll_interval_sec", default_seconds))
     except Exception:
         return default_seconds
@@ -80,9 +87,10 @@ def _compute_volume_and_atr(
     return vol_5m, vol_15m, vol_avg_1h, atr
 
 
-async def fetch_market_snapshot_from_binance(settings: Settings) -> MarketSnapshot:
+async def fetch_market_snapshot_from_binance(
+    ex: ccxt.Exchange, settings: Settings
+) -> MarketSnapshot:
     ts = time.time()
-    ex = ccxt.binance({"enableRateLimit": True})
 
     main_symbol = settings.symbol
     main_symbol_ccxt = main_symbol
@@ -163,10 +171,23 @@ async def main_loop() -> None:
     async with app:
         await app.start()
 
+        cfg = load_config()
         settings = Settings.load()
         state = State.load(settings)
 
         poll_interval = load_config_poll_interval(default_seconds=30)
+
+        # Khởi tạo Binance client với API key đọc từ config.yaml (binance_read)
+        binance_cfg = cfg.get("binance_read") or {}
+        api_key = binance_cfg.get("apiKey") or ""
+        secret = binance_cfg.get("secret") or ""
+        ex = ccxt.binance(
+            {
+                "apiKey": api_key,
+                "secret": secret,
+                "enableRateLimit": True,
+            }
+        )
         logger.info(
             "agent_eth V3-light loop started (symbol=%s, poll=%ss, data=Binance).",
             settings.symbol,
@@ -178,7 +199,7 @@ async def main_loop() -> None:
                 settings = Settings.load()
                 state = State.load(settings)
 
-                mkt = await fetch_market_snapshot_from_binance(settings)
+                mkt = await fetch_market_snapshot_from_binance(ex, settings)
 
                 proposal = build_buy_proposal(settings, state, mkt)
                 if proposal:
