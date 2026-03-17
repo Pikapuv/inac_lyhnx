@@ -201,6 +201,16 @@ async def main_loop() -> None:
 
                 mkt = await fetch_market_snapshot_from_binance(ex, settings)
 
+                symbol_key = settings.symbol.replace("/", "")
+                price_now = mkt.prices.get(symbol_key)
+                change_5m_main = mkt.changes_5m.get(symbol_key)
+                logger.info(
+                    "Tick: %s price=%.4f change_5m=%s",
+                    settings.symbol,
+                    price_now if price_now is not None else -1.0,
+                    f"{change_5m_main:.3f}%" if change_5m_main is not None else "n/a",
+                )
+
                 proposal = build_buy_proposal(settings, state, mkt)
                 if proposal:
                     logger.info("BUY proposal generated at price %.4f", proposal.price)
