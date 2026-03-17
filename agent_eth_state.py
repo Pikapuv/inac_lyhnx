@@ -32,10 +32,23 @@ class State:
     position_open_time: float | None = None
     size_usdt: float | None = None
     size_coin: float | None = None
+    buy_fee_usdt: float | None = None
+    # For auto tracking via Binance my-trades
+    buy_trade_id: str | None = None
+    last_trade_check_ts: float | None = None
+
+    # Proposal đang chờ người dùng bấm ENTER/SKIP
+    pending_proposal_id: str | None = None
+    pending_proposal_ts: float | None = None
     tp_alert_sent: bool = False
     sl_alert_sent: bool = False
+    time_stop_alert_sent: bool = False
 
     auto_trade_enabled: bool = False
+
+    # V3-light V2 risk/day: khi chạm limit thì "khóa" giao dịch cả ngày.
+    daily_limit_reached: bool = False
+    daily_limit_notified: bool = False
 
     @classmethod
     def new_for_day(cls, settings: Settings) -> "State":
@@ -70,9 +83,16 @@ class State:
             position_open_time=raw.get("position_open_time"),
             size_usdt=raw.get("size_usdt"),
             size_coin=raw.get("size_coin"),
+            buy_trade_id=raw.get("buy_trade_id"),
+            last_trade_check_ts=raw.get("last_trade_check_ts"),
+            pending_proposal_id=raw.get("pending_proposal_id"),
+            pending_proposal_ts=raw.get("pending_proposal_ts"),
             tp_alert_sent=raw.get("tp_alert_sent", False),
             sl_alert_sent=raw.get("sl_alert_sent", False),
+            time_stop_alert_sent=raw.get("time_stop_alert_sent", False),
             auto_trade_enabled=raw.get("auto_trade_enabled", False),
+            daily_limit_reached=raw.get("daily_limit_reached", False),
+            daily_limit_notified=raw.get("daily_limit_notified", False),
         )
 
         if state.trading_day != current_trading_day():

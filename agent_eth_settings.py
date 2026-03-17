@@ -21,12 +21,35 @@ class Settings:
     daily_limit_pct: float = 3.0
     max_trades_per_day: int = 3
 
-    tp_pct_min: float = 1.0
-    tp_pct_max: float = 2.0
-    sl_pct: float = 2.0
+    # Theo mục tiêu "winrate cao":
+    # - TP gần hơn (dễ chạm)
+    # - SL rộng hơn (để tỷ lệ đạt TP cao hơn)
+    tp_pct_min: float = 1.8
+    tp_pct_max: float = 2.5
+    sl_pct: float = 4.0
 
     dump_threshold_pct: float = -0.3
     pump_threshold_pct: float = 1.5
+
+    # "Tín hiệu đẹp" (quality filters)
+    rsi_period: int = 14
+    rsi_oversold: float = 30.0
+    support_lookback_bars: int = 20
+    support_margin_pct: float = 0.3
+    ma_trend_period: int = 50
+
+    # Mỗi ngày phải có ít nhất 1 lệnh:
+    # nếu chưa có lệnh nào mà đến giờ UTC muộn -> nới yêu cầu chất lượng để vẫn có giao dịch.
+    quality_min_conditions: int = 4
+    quality_fallback_min_conditions: int = 2
+    force_min_trades_from_hour_utc: int = 20
+
+    # Khi gửi cảnh báo TP, ưu tiên chốt lời ngay (tăng winrate).
+    close_on_tp_alert: bool = True
+
+    # Khi gửi tín hiệu BUY mà user chưa ENTER trong khoảng thời gian này (giây),
+    # bot sẽ nhắc nhở và (nếu còn valid) gửi tín hiệu mới.
+    proposal_ttl_seconds: int = 300
 
     symbol: str = "ETH/USDT"
 
@@ -62,11 +85,25 @@ class Settings:
             initial_capital_usdt=raw.get("initial_capital_usdt", 20.0),
             daily_limit_pct=raw.get("daily_limit_pct", 3.0),
             max_trades_per_day=raw.get("max_trades_per_day", 3),
-            tp_pct_min=raw.get("tp_pct_min", 1.0),
-            tp_pct_max=raw.get("tp_pct_max", 2.0),
-            sl_pct=raw.get("sl_pct", 2.0),
+            tp_pct_min=raw.get("tp_pct_min", 1.8),
+            tp_pct_max=raw.get("tp_pct_max", 2.5),
+            sl_pct=raw.get("sl_pct", 4.0),
             dump_threshold_pct=raw.get("dump_threshold_pct", -0.3),
             pump_threshold_pct=raw.get("pump_threshold_pct", 1.5),
+            rsi_period=raw.get("rsi_period", 14),
+            rsi_oversold=raw.get("rsi_oversold", 30.0),
+            support_lookback_bars=raw.get("support_lookback_bars", 20),
+            support_margin_pct=raw.get("support_margin_pct", 0.3),
+            ma_trend_period=raw.get("ma_trend_period", 50),
+            quality_min_conditions=raw.get("quality_min_conditions", 4),
+            quality_fallback_min_conditions=raw.get(
+                "quality_fallback_min_conditions", 2
+            ),
+            force_min_trades_from_hour_utc=raw.get(
+                "force_min_trades_from_hour_utc", 20
+            ),
+            close_on_tp_alert=raw.get("close_on_tp_alert", True),
+            proposal_ttl_seconds=raw.get("proposal_ttl_seconds", 300),
             symbol=raw.get("symbol", "ETH/USDT"),
             trading_sessions=sessions or cls.default_sessions(),
             auto_trade_day=raw.get("auto_trade_day", False),

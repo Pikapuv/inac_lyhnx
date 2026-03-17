@@ -21,6 +21,7 @@ from agent_eth_telegram import (
     build_application,
     send_buy_proposal_message,
     send_tp_sl_time_stop_message,
+    expire_pending_proposal,
 )
 
 
@@ -29,6 +30,150 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s – %(message)s",
 )
 logger = logging.getLogger("agent_eth")
+
+
+def _split_symbol(symbol: str) -> tuple[str, str]:
+    if "/" not in symbol:
+        return symbol, ""
+    base, quote = symbol.split("/", 1)
+    return base, quote
+
+
+def _trade_cost_quote_usdt(trade: Dict) -> float:
+    # ccxt spot trade: `cost` is usually quote amount.
+    if trade.get("cost") is not None:
+        return float(trade["cost"])
+    price = float(trade.get("price") or 0.0)
+    amount = float(trade.get("amount") or 0.0)
+    return price * amount
+
+
+def _trade_fee_quote_usdt(trade: Dict) -> float:
+    fee = trade.get("fee") or {}
+    cost = fee.get("cost")
+    if cost is None:
+        return 0.0
+    return float(cost)
+
+
+def _format_symbol(symbol: str) -> str:
+    return symbol.replace("/", "")
+
+
+async def sync_position_from_binance_trades(
+    ex: ccxt.Exchange,
+    settings: Settings,
+    state: State,
+    notify_message,
+) -> None:
+    """
+    Auto tracking for manual entry/exit:
+    - When user pressed ENTER, we mark state.has_position + position_open_time.
+    - This function scans `fetch_my_trades` since the last check:
+      * find the BUY trade after position_open_time (if not matched yet)
+      * when a SELL trade arrives after BUY, treat it as closing the position and update pnl_day_usdt.
+    """
+    if not state.has_position or state.position_open_time is None:
+        return
+
+    since_ts = state.last_trade_check_ts or state.position_open_time
+    since_ms = int(since_ts * 1000)
+
+    try:
+        new_trades = ex.fetch_my_trades(settings.symbol, since=since_ms)
+    except Exception as e:
+        logger.warning("sync_position_from_binance_trades failed: %s", e)
+        return
+
+    # Always advance the cursor even if no trades found
+    state.last_trade_check_ts = time.time()
+    state.save()
+
+    if not new_trades:
+        return
+
+    base, quote = _split_symbol(settings.symbol)
+
+    # Sort by timestamp ascending
+    new_trades = sorted(new_trades, key=lambda t: t.get("timestamp") or 0)
+
+    # 1) Match BUY trade (entry)
+    if state.buy_trade_id is None:
+        for tr in new_trades:
+            ts_s = (tr.get("timestamp") or 0) / 1000.0
+            if ts_s < (state.position_open_time or 0):
+                continue
+            if tr.get("side") != "buy":
+                continue
+
+            state.buy_trade_id = str(tr.get("id"))
+            state.entry_price = float(tr.get("price") or 0.0)
+
+            buy_cost = _trade_cost_quote_usdt(tr)
+            buy_fee = _trade_fee_quote_usdt(tr)
+            state.buy_fee_usdt = buy_fee
+            # size_usdt represents quote spent (approx, excluding fee or including it is small)
+            state.size_usdt = buy_cost
+            state.size_coin = float(tr.get("amount") or 0.0)
+            state.save()
+            await notify_message(
+                f"Đã khớp lệnh BUY trên Binance.\n"
+                f"Entry: {state.entry_price:.4f} ({settings.symbol})\n"
+                f"UTC: {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(ts_s))}"
+            )
+            break
+
+    # 2) If we have an entry buy, look for the first SELL after it
+    if state.buy_trade_id is None:
+        return
+
+    buy_cost_usdt = state.size_usdt or 0.0
+    buy_fee_usdt = state.buy_fee_usdt or 0.0
+    if buy_cost_usdt <= 0:
+        return
+
+    for tr in new_trades:
+        if tr.get("side") != "sell":
+            continue
+
+        ts_s = (tr.get("timestamp") or 0) / 1000.0
+        if ts_s < (state.position_open_time or 0):
+            continue
+
+        sell_cost_usdt = _trade_cost_quote_usdt(tr)
+        sell_fee_usdt = _trade_fee_quote_usdt(tr)
+
+        # Spot PnL approximation in quote currency:
+        # PnL = sell proceeds - buy cost - (fees)
+        # We treat fees as quote costs.
+        pnl_usdt = (sell_cost_usdt - buy_cost_usdt) - (buy_fee_usdt + sell_fee_usdt)
+
+        state.pnl_day_usdt += pnl_usdt
+        state.has_position = False
+        state.entry_price = None
+        state.position_open_time = None
+        state.size_usdt = None
+        state.size_coin = None
+        state.buy_trade_id = None
+        state.buy_fee_usdt = None
+        state.tp_alert_sent = False
+        state.sl_alert_sent = False
+        state.time_stop_alert_sent = False
+        state.trades_closed += 1
+        state.save()
+
+        logger.info("Auto-tracked CLOSE pnl_day_usdt=%.4f (pnl=%.4f)", state.pnl_day_usdt, pnl_usdt)
+        label = "CHỐT LỜI" if pnl_usdt >= 0 else "CẮT LỖ"
+        daily_limit = state.daily_limit_usdt
+        left = daily_limit - abs(state.pnl_day_usdt)
+        await notify_message(
+            f"Đã khớp lệnh SELL: {label}\n"
+            f"P&L lệnh: {pnl_usdt:.4f} USDT\n"
+            f"P&L ngày hiện tại: {state.pnl_day_usdt:.4f} USDT "
+            f"(limit ±{daily_limit:.4f})\n"
+            f"Còn dư biên hôm nay: {left:.4f} USDT"
+        )
+        return
 
 
 def load_config() -> Dict:
@@ -96,8 +241,8 @@ async def fetch_market_snapshot_from_binance(
     main_symbol_ccxt = main_symbol
     symbol_key = main_symbol.replace("/", "")
 
-    # Fetch OHLCV for main symbol on 5m timeframe, ~60 minutes (12 bars)
-    ohlcv_main = _fetch_ohlcv(ex, main_symbol_ccxt, "5m", limit=20)
+    # Fetch OHLCV for main symbol on 5m timeframe, enough for RSI / MA / candle patterns
+    ohlcv_main = _fetch_ohlcv(ex, main_symbol_ccxt, "5m", limit=200)
     if not ohlcv_main:
         raise RuntimeError(f"Không lấy được dữ liệu OHLCV cho {main_symbol_ccxt}")
 
@@ -157,6 +302,7 @@ async def fetch_market_snapshot_from_binance(
         changes_15m=changes_15m,
         volumes=volumes,
         atrs=atrs,
+        ohlcv_5m=ohlcv_main,
     )
 
 
@@ -210,6 +356,36 @@ async def main_loop() -> None:
 
                 mkt = await fetch_market_snapshot_from_binance(ex, settings)
 
+                # Sync position open/close from Binance trades (auto tracking)
+                if state.has_position:
+                    async def notify_message(text: str) -> None:
+                        await app.bot.send_message(chat_id=chat_id, text=text)
+
+                    await sync_position_from_binance_trades(
+                        ex, settings, state, notify_message=notify_message
+                    )
+                    # Reload state because sync_position may close the position
+                    state = State.load(settings)
+
+                # Daily risk lock + notify once
+                if (
+                    state.auto_trade_enabled
+                    and not state.daily_limit_notified
+                    and abs(state.pnl_day_usdt) >= state.daily_limit_usdt
+                ):
+                    state.daily_limit_reached = True
+                    state.daily_limit_notified = True
+                    state.save()
+                    await app.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            "[agent_eth] Chạm giới hạn P&L/ngày.\n"
+                            f"P&L ngày: {state.pnl_day_usdt:.4f} USDT "
+                            f"(limit ±{state.daily_limit_usdt:.4f}).\n"
+                            "Tạm dừng tạo tín hiệu BUY cho tới khi sang ngày mới (UTC)."
+                        ),
+                    )
+
                 symbol_key = settings.symbol.replace("/", "")
                 price_now = mkt.prices.get(symbol_key)
                 change_5m_main = mkt.changes_5m.get(symbol_key)
@@ -220,10 +396,64 @@ async def main_loop() -> None:
                     f"{change_5m_main:.3f}%" if change_5m_main is not None else "n/a",
                 )
 
-                proposal = build_buy_proposal(settings, state, mkt)
-                if proposal:
-                    logger.info("BUY proposal generated at price %.4f", proposal.price)
-                    await send_buy_proposal_message(app, chat_id, proposal)
+                if not state.has_position:
+                    ttl_just_expired = False
+                    # Nếu đang có pending proposal và chưa hết hạn -> không sinh thêm tín hiệu
+                    if (
+                        state.pending_proposal_id
+                        and state.pending_proposal_ts is not None
+                        and time.time() - state.pending_proposal_ts
+                        < settings.proposal_ttl_seconds
+                    ):
+                        await asyncio.sleep(0)  # yield
+                        continue
+
+                    # Nếu pending đã hết hạn mà user chưa ENTER/SKIP
+                    if state.pending_proposal_id and state.pending_proposal_ts is not None:
+                        if (
+                            time.time()
+                            - state.pending_proposal_ts
+                            >= settings.proposal_ttl_seconds
+                        ):
+                            # Proposal hết hạn: gỡ khỏi bộ nhớ để user không thể ENTER/SKIP muộn
+                            expire_pending_proposal(state.pending_proposal_id)
+                            await app.bot.send_message(
+                                chat_id=chat_id,
+                                text=(
+                                    f"[agent_eth] Tín hiệu BUY đã qua thời gian chờ "
+                                    f"({settings.proposal_ttl_seconds}s). "
+                                    f"Kiểm tra lại tín hiệu mới..."
+                                ),
+                            )
+                            state.pending_proposal_id = None
+                            state.pending_proposal_ts = None
+                            state.save()
+                            ttl_just_expired = True
+
+                    # Sinh tín hiệu mới nếu entry mode ON và không còn pending
+                    if state.auto_trade_enabled and not state.pending_proposal_id:
+                        proposal = build_buy_proposal(settings, state, mkt)
+                        if proposal:
+                            state.pending_proposal_id = proposal.id
+                            state.pending_proposal_ts = time.time()
+                            state.save()
+
+                            logger.info(
+                                "BUY proposal generated at price %.4f",
+                                proposal.price,
+                            )
+                            await send_buy_proposal_message(app, chat_id, proposal)
+                        else:
+                            # Không có tín hiệu mới tại thời điểm check
+                            if ttl_just_expired:
+                                await app.bot.send_message(
+                                    chat_id=chat_id,
+                                    text="[agent_eth] Không thấy tín hiệu phù hợp tại thời điểm này. Chờ tín hiệu mới...",
+                                )
+                    elif not state.auto_trade_enabled:
+                        logger.info(
+                            "Entry paused: skip BUY proposal generation."
+                        )
 
                 symbol_key = settings.symbol.replace("/", "")
                 price_now = mkt.prices.get(symbol_key)
@@ -254,6 +484,8 @@ async def main_loop() -> None:
                         await send_tp_sl_time_stop_message(
                             app, chat_id, "TIME", pnl_pct
                         )
+                        state.time_stop_alert_sent = True
+                        state.save()
 
                 await asyncio.sleep(poll_interval)
         finally:
