@@ -78,7 +78,16 @@ def build_buy_proposal(
         return None
 
     change_5m = mkt.changes_5m.get(symbol_key)
-    if change_5m is None or change_5m >= settings.dump_threshold_pct:
+    if change_5m is None:
+        return None
+
+    # Không mua nếu đang pump mạnh hơn ngưỡng pump_threshold_pct
+    # (ví dụ > +1.5%) – tránh FOMO đu đỉnh.
+    if change_5m >= settings.pump_threshold_pct:
+        return None
+
+    # Chỉ quan tâm khi có dump đủ sâu so với dump_threshold_pct
+    if change_5m >= settings.dump_threshold_pct:
         return None
 
     sol_change = change_5m
