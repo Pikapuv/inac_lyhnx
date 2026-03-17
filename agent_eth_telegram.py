@@ -170,7 +170,8 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"Max lệnh/ngày: {settings.max_trades_per_day}\n"
         f"TP: {settings.tp_pct_min:.1f}–{settings.tp_pct_max:.1f}%\n"
         f"SL: {settings.sl_pct:.1f}%\n"
-        f"Dump threshold: {settings.dump_threshold_pct:.1f}%\n"
+        f"Dump threshold 5m: {settings.dump_threshold_pct:.1f}%\n"
+        f"Dump threshold 1h: {settings.dump_threshold_1h_pct:.1f}%\n"
     )
 
     keyboard = [
@@ -180,7 +181,8 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         ],
         [
             InlineKeyboardButton("⚙ TP/SL", callback_data="SET:TPSL"),
-            InlineKeyboardButton("⚙ Dump threshold", callback_data="SET:DUMP"),
+            InlineKeyboardButton("⚙ Dump threshold 5m", callback_data="SET:DUMP"),
+            InlineKeyboardButton("⚙ Dump threshold 1h", callback_data="SET:DUMP1H"),
         ],
         [
             InlineKeyboardButton("⚙ Max lệnh/ngày", callback_data="SET:MAXTRADES"),
@@ -214,6 +216,10 @@ async def handle_settings_callback(
     elif key == "DUMP":
         prompt = (
             "Nhập **dump threshold 5m (%)** mới (âm), ví dụ: `-0.3`."
+        )
+    elif key == "DUMP1H":
+        prompt = (
+            "Nhập **dump threshold 1h (%)** mới (âm), ví dụ: `-1.0`."
         )
     elif key == "MAXTRADES":
         prompt = (
@@ -261,6 +267,10 @@ async def handle_setting_input(
             value = float(text)
             settings.dump_threshold_pct = value
             msg_ok = f"Đã cập nhật **dump threshold 5m** = {value:.2f}%."
+        elif key == "DUMP1H":
+            value = float(text)
+            settings.dump_threshold_1h_pct = value
+            msg_ok = f"Đã cập nhật **dump threshold 1h** = {value:.2f}%."
         elif key == "MAXTRADES":
             value = int(text)
             settings.max_trades_per_day = value

@@ -156,6 +156,7 @@ async def sync_position_from_binance_trades(
         state.size_coin = None
         state.buy_trade_id = None
         state.buy_fee_usdt = None
+        state.cooldown_until_ts = time.time() + settings.cooldown_minutes_after_close * 60
         state.tp_alert_sent = False
         state.sl_alert_sent = False
         state.time_stop_alert_sent = False
@@ -250,6 +251,8 @@ async def fetch_market_snapshot_from_binance(
 
     change_5m_main = _compute_change_pct_from_ohlcv(ohlcv_main, bars=1)
     change_15m_main = _compute_change_pct_from_ohlcv(ohlcv_main, bars=3)
+    # 1h = 12 cây 5m
+    change_1h_main = _compute_change_pct_from_ohlcv(ohlcv_main, bars=12)
     vol_5m_main, vol_15m_main, vol_avg_1h_main, atr_main = _compute_volume_and_atr(
         ohlcv_main
     )
@@ -257,6 +260,7 @@ async def fetch_market_snapshot_from_binance(
     prices: Dict[str, float] = {symbol_key: last_close}
     changes_5m: Dict[str, float] = {}
     changes_15m: Dict[str, float] = {}
+    changes_1h: Dict[str, float] = {}
     volumes: Dict[str, float] = {}
     atrs: Dict[str, float] = {}
 
@@ -264,6 +268,8 @@ async def fetch_market_snapshot_from_binance(
         changes_5m[symbol_key] = change_5m_main
     if change_15m_main is not None:
         changes_15m[symbol_key] = change_15m_main
+    if change_1h_main is not None:
+        changes_1h[symbol_key] = change_1h_main
 
     volumes[symbol_key] = vol_5m_main
     volumes[f"{symbol_key}_15M"] = vol_15m_main
@@ -300,6 +306,7 @@ async def fetch_market_snapshot_from_binance(
         prices=prices,
         changes_5m=changes_5m,
         changes_15m=changes_15m,
+        changes_1h=changes_1h,
         volumes=volumes,
         atrs=atrs,
         ohlcv_5m=ohlcv_main,

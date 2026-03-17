@@ -14,6 +14,7 @@ class MarketSnapshot:
     prices: Dict[str, float]
     changes_5m: Dict[str, float]
     changes_15m: Dict[str, float]
+    changes_1h: Dict[str, float]
     volumes: Dict[str, float]
     atrs: Dict[str, float]
     # OHLCV candles for main symbol (5m), used for quality filters (RSI / support / candle pattern)
@@ -55,11 +56,13 @@ def within_trading_session(settings: Settings, now_utc: datetime) -> bool:
     return False
 
 
-def can_open_new_trade(settings: Settings, state: State) -> bool:
+def can_open_new_trade(settings: Settings, state: State, now_ts: float) -> bool:
     if state.daily_limit_reached:
         return False
     if abs(state.pnl_day_usdt) >= state.daily_limit_usdt:
         state.daily_limit_reached = True
+        return False
+    if state.cooldown_until_ts is not None and now_ts < state.cooldown_until_ts:
         return False
     if state.trades_opened >= settings.max_trades_per_day:
         return False
@@ -95,6 +98,39 @@ def _rsi(closes: List[float], period: int) -> Optional[float]:
         return 100.0
     rs = avg_gain / avg_loss
     return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _ema(values: List[float], period: int) -> Optional[float]:
+    if period <= 0 or len(values) < period:
+        return None
+    k = 2.0 / (period + 1.0)
+    ema = sum(values[:period]) / period
+    for v in values[period:]:
+        ema = v * k + (1.0 - k) * ema
+    return ema
+
+
+def _downsample_5m_to_1h_closes(
+    ohlcv_5m: List[Tuple[float, float, float, float, float, float]],
+    current_ts: float,
+) -> List[float]:
+    """
+    Downsample 5m candles into completed 1h closes using candle timestamps.
+    We drop the current/incomplete 1h bucket.
+    """
+    if not ohlcv_5m:
+        return []
+    latest_hour_start = int(current_ts // 3600) * 3600
+    bucket: Dict[int, float] = {}
+    for row in ohlcv_5m:
+        ts = row[0]
+        hour_start = int(ts // 3600) * 3600
+        if hour_start >= latest_hour_start:
+            continue
+        bucket[hour_start] = row[4]  # last close in the hour
+    if not bucket:
+        return []
+    return [bucket[h] for h in sorted(bucket.keys())]
 
 
 def _is_bullish_candle(ohlcv: List[Tuple[float, float, float, float, float, float]]) -> bool:
@@ -136,10 +172,11 @@ def build_buy_proposal(
     settings: Settings, state: State, mkt: MarketSnapshot
 ) -> Optional[BuyProposal]:
     now_utc = datetime.fromtimestamp(mkt.ts, tz=timezone.utc)
+    now_ts = mkt.ts
 
     if not within_trading_session(settings, now_utc):
         return None
-    if not can_open_new_trade(settings, state):
+    if not can_open_new_trade(settings, state, now_ts=now_ts):
         return None
 
     symbol_key = settings.symbol.replace("/", "")
@@ -147,102 +184,60 @@ def build_buy_proposal(
     if price_now is None:
         return None
 
+    if not mkt.ohlcv_5m:
+        return None
+
+    # Trend filter: EMA50_1h (chỉ dùng 1h đóng đủ từ chuỗi 5m downsample theo hour bucket)
+    closes_1h = _downsample_5m_to_1h_closes(mkt.ohlcv_5m, current_ts=now_ts)
+    ema = _ema(closes_1h, settings.ema_trend_period_1h)
+    if ema is None:
+        return None
+    trend_ok = price_now > ema
+    if not trend_ok:
+        return None
+
+    # Dip (1h): change_1h <= -1.5% (config bằng dump_threshold_1h_pct)
+    change_1h = mkt.changes_1h.get(symbol_key)
+    if change_1h is None or change_1h > settings.dump_threshold_1h_pct:
+        return None
+
+    # Avoid FOMO: nếu 5m đang pump mạnh thì không vào
     change_5m = mkt.changes_5m.get(symbol_key)
-    if change_5m is None:
+    if change_5m is not None and change_5m >= settings.pump_threshold_pct:
         return None
 
-    # Không mua nếu đang pump mạnh hơn ngưỡng pump_threshold_pct
-    # (ví dụ > +1.5%) – tránh FOMO đu đỉnh.
-    if change_5m >= settings.pump_threshold_pct:
+    # Stabilizing: RSI_5m thấp + last candle green + volume_increase
+    closes_5m = [row[4] for row in mkt.ohlcv_5m]
+    last_open = mkt.ohlcv_5m[-1][1]
+    last_close = mkt.ohlcv_5m[-1][4]
+    last_candle_green = last_close > last_open
+    if not last_candle_green:
         return None
 
-    # Chỉ quan tâm khi có dump đủ sâu so với dump_threshold_pct
-    if change_5m >= settings.dump_threshold_pct:
-        return None
-
-    # "Ít lệnh - chất lượng": yêu cầu dump lan sang khung 15m
-    # Nếu chỉ dump 5m nhưng 15m không dump đủ sâu, bỏ tín hiệu.
-    change_15m = mkt.changes_15m.get(symbol_key)
-    if change_15m is None or change_15m > settings.dump_threshold_pct:
-        return None
-
-    sol_change = change_5m
-    btc_change = mkt.changes_5m.get("BTCUSDT")
-    solbtc_change = mkt.changes_5m.get("SOLBTC")
-
-    if btc_change is not None and not (sol_change < btc_change):
-        return None
-    if solbtc_change is not None and not (solbtc_change <= 0):
+    rsi_5m = _rsi(closes_5m, settings.rsi_period)
+    if rsi_5m is None or rsi_5m > settings.rsi_reversal_threshold_5m:
         return None
 
     vol_5m = mkt.volumes.get(symbol_key)
     vol_avg_1h = mkt.volumes.get(f"{symbol_key}_AVG1H")
-    if vol_5m is not None and vol_avg_1h is not None:
-        if not (vol_5m > 1.0 * vol_avg_1h):
-            return None
-
-    atr_5m = mkt.atrs.get(symbol_key)
-    if atr_5m is not None:
-        if atr_5m <= 0:
-            return None
-
-    # -------- "Tín hiệu đẹp" (quality filters) --------
-    # Mục tiêu: chỉ BUY khi có nhiều yếu tố xác nhận cùng lúc.
-    if not mkt.ohlcv_5m or len(mkt.ohlcv_5m) < max(
-        settings.support_lookback_bars,
-        settings.ma_trend_period,
-        settings.rsi_period + 1,
-    ):
+    if vol_5m is None or vol_avg_1h is None:
+        return None
+    volume_increase = vol_5m > vol_avg_1h
+    if not volume_increase:
         return None
 
-    ohlcv = mkt.ohlcv_5m
-    closes = [row[4] for row in ohlcv]
-    lows = [row[3] for row in ohlcv]
-    last_close = closes[-1]
-    last_low = lows[-1]
-
-    recent_low = min(lows[-settings.support_lookback_bars :])
-    cond_support = last_low <= recent_low * (
-        1.0 + settings.support_margin_pct / 100.0
-    )
-
-    cond_bullish_candle = _is_bullish_candle(ohlcv)
-
-    rsi = _rsi(closes, settings.rsi_period)
-    rsi_prev = _rsi(closes[:-1], settings.rsi_period)
-    # RSI quay đầu (momentum tăng dần) để tăng winrate
-    cond_rsi_turn = (
-        rsi is not None
-        and rsi_prev is not None
-        and rsi_prev <= settings.rsi_oversold
-        and rsi >= rsi_prev
-    )
-    cond_rsi = rsi is not None and rsi <= settings.rsi_oversold
-
-    ma = _sma(closes, settings.ma_trend_period)
-    cond_trend = ma is not None and last_close >= ma
-
-    quality_score = sum(
-        [cond_support, cond_bullish_candle, cond_rsi, cond_rsi_turn, cond_trend]
-    )  # type: ignore[arg-type]
-
-    # Ít lệnh - chất lượng: yêu cầu nhiều điều kiện.
-    # Nhưng để "mỗi ngày UTC vẫn ít nhất 1 lệnh", nếu gần cuối ngày mà chưa có lệnh nào,
-    # nới yêu cầu quality.
-    min_required = settings.quality_min_conditions
-    if state.trades_opened == 0 and now_utc.hour >= settings.force_min_trades_from_hour_utc:
-        min_required = settings.quality_fallback_min_conditions
-    if (
-        state.trades_opened == 0
-        and now_utc.hour >= settings.force_min_trades_from_hour_utc + 2
-    ):
-        min_required = 1
-
-    if quality_score < min_required:
+    # Not near resistance: recent_high trong 3h, cần còn upside > 1%
+    lookback_bars = max(1, settings.resistance_lookback_hours * 12)
+    highs = [row[2] for row in mkt.ohlcv_5m[-lookback_bars:]]
+    if not highs:
+        return None
+    recent_high = max(highs)
+    distance_to_recent_high_pct = (recent_high - price_now) / price_now * 100.0
+    if distance_to_recent_high_pct <= settings.resistance_distance_pct_min:
         return None
 
+    # Size & TP/SL (70% vốn mỗi lệnh)
     c0 = settings.initial_capital_usdt
-    # Mỗi lệnh dùng cố định 70% vốn (theo yêu cầu "ít lệnh - chất lượng").
     stake_pct = 0.70
     size_usdt = stake_pct * c0
     size_coin = size_usdt / price_now
@@ -252,7 +247,6 @@ def build_buy_proposal(
     sl = price_now * (1 - settings.sl_pct / 100.0)
 
     proposal_id = f"{int(mkt.ts)}"
-
     return BuyProposal(
         id=proposal_id,
         symbol=settings.symbol,

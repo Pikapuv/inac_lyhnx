@@ -50,6 +50,9 @@ class State:
     daily_limit_reached: bool = False
     daily_limit_notified: bool = False
 
+    # Cooldown sau khi bot phát hiện position đã đóng (SELL fill)
+    cooldown_until_ts: float | None = None
+
     @classmethod
     def new_for_day(cls, settings: Settings) -> "State":
         day = current_trading_day()
@@ -93,6 +96,7 @@ class State:
             auto_trade_enabled=raw.get("auto_trade_enabled", False),
             daily_limit_reached=raw.get("daily_limit_reached", False),
             daily_limit_notified=raw.get("daily_limit_notified", False),
+            cooldown_until_ts=raw.get("cooldown_until_ts"),
         )
 
         if state.trading_day != current_trading_day():

@@ -29,6 +29,7 @@ class Settings:
     sl_pct: float = 4.0
 
     dump_threshold_pct: float = -0.3
+    dump_threshold_1h_pct: float = -1.0
     pump_threshold_pct: float = 1.5
 
     # "Tín hiệu đẹp" (quality filters)
@@ -50,6 +51,18 @@ class Settings:
     # Khi gửi tín hiệu BUY mà user chưa ENTER trong khoảng thời gian này (giây),
     # bot sẽ nhắc nhở và (nếu còn valid) gửi tín hiệu mới.
     proposal_ttl_seconds: int = 300
+
+    # Trend & entry quality (flow: Trend + Dip + Stabilizing)
+    # EMA50_1h: chỉ cập nhật dựa trên 1h đã đóng (handled in strategy by grouping 5m candles)
+    ema_trend_period_1h: int = 50
+    rsi_reversal_threshold_5m: float = 35.0
+
+    # Not near resistance: recent high trong 3h
+    resistance_lookback_hours: int = 3
+    resistance_distance_pct_min: float = 1.0  # >1% upside needed
+
+    # Cooldown: tính từ lúc bot phát hiện SELL fill (position_closed)
+    cooldown_minutes_after_close: int = 30
 
     symbol: str = "ETH/USDT"
 
@@ -89,6 +102,7 @@ class Settings:
             tp_pct_max=raw.get("tp_pct_max", 2.5),
             sl_pct=raw.get("sl_pct", 4.0),
             dump_threshold_pct=raw.get("dump_threshold_pct", -0.3),
+            dump_threshold_1h_pct=raw.get("dump_threshold_1h_pct", -1.0),
             pump_threshold_pct=raw.get("pump_threshold_pct", 1.5),
             rsi_period=raw.get("rsi_period", 14),
             rsi_oversold=raw.get("rsi_oversold", 30.0),
@@ -104,6 +118,17 @@ class Settings:
             ),
             close_on_tp_alert=raw.get("close_on_tp_alert", True),
             proposal_ttl_seconds=raw.get("proposal_ttl_seconds", 300),
+            ema_trend_period_1h=raw.get("ema_trend_period_1h", 50),
+            rsi_reversal_threshold_5m=raw.get(
+                "rsi_reversal_threshold_5m", 35.0
+            ),
+            resistance_lookback_hours=raw.get("resistance_lookback_hours", 3),
+            resistance_distance_pct_min=raw.get(
+                "resistance_distance_pct_min", 1.0
+            ),
+            cooldown_minutes_after_close=raw.get(
+                "cooldown_minutes_after_close", 30
+            ),
             symbol=raw.get("symbol", "ETH/USDT"),
             trading_sessions=sessions or cls.default_sessions(),
             auto_trade_day=raw.get("auto_trade_day", False),
