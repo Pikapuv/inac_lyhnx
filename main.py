@@ -3,9 +3,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import random
 import time
-from typing import Dict
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import ccxt
+import yaml
 
 from agent_eth_settings import Settings
 from agent_eth_state import State
@@ -28,31 +31,116 @@ logging.basicConfig(
 logger = logging.getLogger("agent_eth")
 
 
-async def mock_fetch_market_snapshot(settings: Settings) -> MarketSnapshot:
+def load_config_poll_interval(default_seconds: int = 30) -> int:
+    cfg_path = Path("config.yaml")
+    if not cfg_path.exists():
+        return default_seconds
+    try:
+        raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+        strategy = raw.get("strategy") or {}
+        return int(strategy.get("poll_interval_sec", default_seconds))
+    except Exception:
+        return default_seconds
+
+
+def _fetch_ohlcv(
+    ex: ccxt.Exchange, symbol: str, timeframe: str, limit: int
+) -> List[Tuple[float, float, float, float, float]]:
+    ohlcv = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    return [(t, o, h, l, c, v) for (t, o, h, l, c, v) in ohlcv]
+
+
+def _compute_change_pct_from_ohlcv(
+    ohlcv: List[Tuple[float, float, float, float, float]], bars: int
+) -> float | None:
+    if len(ohlcv) < bars + 1:
+        return None
+    prev_close = ohlcv[-(bars + 1)][4]
+    last_close = ohlcv[-1][4]
+    if prev_close <= 0:
+        return None
+    return (last_close - prev_close) / prev_close * 100.0
+
+
+def _compute_volume_and_atr(
+    ohlcv: List[Tuple[float, float, float, float, float]],
+) -> Tuple[float, float, float]:
+    if not ohlcv:
+        return 0.0, 0.0, 0.0
+    # Volumes: last 5m (1 bar), last 15m (3 bars), avg 1h (12 bars)
+    vols = [row[5] for row in ohlcv]
+    vol_5m = vols[-1]
+    vol_15m = sum(vols[-3:]) if len(vols) >= 3 else sum(vols)
+    last_12 = vols[-12:] if len(vols) >= 12 else vols
+    vol_avg_1h = sum(last_12) / len(last_12)
+
+    # Simple ATR: average high-low over last 12 bars
+    trs = [(row[2] - row[3]) for row in ohlcv[-12:]]
+    atr = sum(trs) / len(trs)
+    return vol_5m, vol_15m, vol_avg_1h, atr
+
+
+async def fetch_market_snapshot_from_binance(settings: Settings) -> MarketSnapshot:
     ts = time.time()
-    base_price = 2300.0
-    price = base_price * (1 + random.uniform(-0.01, 0.01))
-    prices: Dict[str, float] = {
-        settings.symbol.replace("/", ""): price,
-        "BTCUSDT": 70000.0,
-        "SOLBTC": 0.0005,
-    }
+    ex = ccxt.binance({"enableRateLimit": True})
 
-    change_5m = random.uniform(-1.5, 1.5)
-    changes_5m = {
-        settings.symbol.replace("/", ""): change_5m,
-        "BTCUSDT": random.uniform(-0.5, 0.5),
-        "SOLBTC": random.uniform(-0.5, 0.5),
-    }
-    changes_15m = {k: v * 1.5 for k, v in changes_5m.items()}
+    main_symbol = settings.symbol
+    main_symbol_ccxt = main_symbol
+    symbol_key = main_symbol.replace("/", "")
 
-    volumes = {
-        settings.symbol.replace("/", ""): random.uniform(10000, 50000),
-        f"{settings.symbol.replace('/', '')}_AVG1H": 15000.0,
-    }
-    atrs = {
-        settings.symbol.replace("/", ""): random.uniform(0.5, 5.0),
-    }
+    # Fetch OHLCV for main symbol on 5m timeframe, ~60 minutes (12 bars)
+    ohlcv_main = _fetch_ohlcv(ex, main_symbol_ccxt, "5m", limit=20)
+    if not ohlcv_main:
+        raise RuntimeError(f"Không lấy được dữ liệu OHLCV cho {main_symbol_ccxt}")
+
+    last_close = ohlcv_main[-1][4]
+
+    change_5m_main = _compute_change_pct_from_ohlcv(ohlcv_main, bars=1)
+    change_15m_main = _compute_change_pct_from_ohlcv(ohlcv_main, bars=3)
+    vol_5m_main, vol_15m_main, vol_avg_1h_main, atr_main = _compute_volume_and_atr(
+        ohlcv_main
+    )
+
+    prices: Dict[str, float] = {symbol_key: last_close}
+    changes_5m: Dict[str, float] = {}
+    changes_15m: Dict[str, float] = {}
+    volumes: Dict[str, float] = {}
+    atrs: Dict[str, float] = {}
+
+    if change_5m_main is not None:
+        changes_5m[symbol_key] = change_5m_main
+    if change_15m_main is not None:
+        changes_15m[symbol_key] = change_15m_main
+
+    volumes[symbol_key] = vol_5m_main
+    volumes[f"{symbol_key}_15M"] = vol_15m_main
+    volumes[f"{symbol_key}_AVG1H"] = vol_avg_1h_main
+    atrs[symbol_key] = atr_main
+
+    # BTCUSDT as reference
+    try:
+        ohlcv_btc = _fetch_ohlcv(ex, "BTC/USDT", "5m", limit=5)
+        if ohlcv_btc:
+            btc_last = ohlcv_btc[-1][4]
+            prices["BTCUSDT"] = btc_last
+            change_5m_btc = _compute_change_pct_from_ohlcv(ohlcv_btc, bars=1)
+            if change_5m_btc is not None:
+                changes_5m["BTCUSDT"] = change_5m_btc
+    except Exception as e:
+        logger.warning("Không lấy được BTCUSDT: %s", e)
+
+    # SOLBTC as optional reference when trading SOL
+    try:
+        ohlcv_solbtc = _fetch_ohlcv(ex, "SOL/BTC", "5m", limit=5)
+        if ohlcv_solbtc:
+            solbtc_last = ohlcv_solbtc[-1][4]
+            prices["SOLBTC"] = solbtc_last
+            change_5m_solbtc = _compute_change_pct_from_ohlcv(ohlcv_solbtc, bars=1)
+            if change_5m_solbtc is not None:
+                changes_5m["SOLBTC"] = change_5m_solbtc
+    except Exception:
+        # Không bắt buộc, chỉ là filter thêm
+        pass
 
     return MarketSnapshot(
         ts=ts,
@@ -78,14 +166,19 @@ async def main_loop() -> None:
         settings = Settings.load()
         state = State.load(settings)
 
-        logger.info("agent_eth V3-light loop started.")
+        poll_interval = load_config_poll_interval(default_seconds=30)
+        logger.info(
+            "agent_eth V3-light loop started (symbol=%s, poll=%ss, data=Binance).",
+            settings.symbol,
+            poll_interval,
+        )
 
         try:
             while True:
                 settings = Settings.load()
                 state = State.load(settings)
 
-                mkt = await mock_fetch_market_snapshot(settings)
+                mkt = await fetch_market_snapshot_from_binance(settings)
 
                 proposal = build_buy_proposal(settings, state, mkt)
                 if proposal:
@@ -122,7 +215,7 @@ async def main_loop() -> None:
                             app, chat_id, "TIME", pnl_pct
                         )
 
-                await asyncio.sleep(30)
+                await asyncio.sleep(poll_interval)
         finally:
             await app.stop()
 
