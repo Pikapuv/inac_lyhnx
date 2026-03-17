@@ -100,6 +100,9 @@ def main():
             cutoff = ts - 30 * 60
             history = [(t0, p0) for (t0, p0) in history if t0 >= cutoff]
 
+            # DEBUG: in mỗi lần quét giá
+            print(f"[agent_eth] price={price:.2f}")
+
             # Reset P&L theo ngày (skeleton)
             today_str = datetime.utcnow().strftime("%Y-%m-%d")
             if last_reset_date is None or last_reset_date != today_str:
