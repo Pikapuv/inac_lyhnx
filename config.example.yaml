@@ -1,0 +1,25 @@
+binance_read:
+  apiKey: "API_KEY_READ"
+  secret: "SECRET_KEY_READ"
+
+strategy:
+  symbol: "ETH/USDT"
+  poll_interval_sec: 60
+  window_short_min: 5
+  window_long_min: 15
+  dump_threshold_pct: -1.5
+  pump_threshold_pct: 1.5
+
+risk:
+  capital_usdt: 20
+  position_pct: 0.25
+  max_loss_pct_per_trade: 2.0
+  target_profit_pct_min: 1.0
+  target_profit_pct_max: 2.0
+  daily_pnl_limit_pct: 3.0
+  max_trades_per_day: 3
+
+telegram:
+  enabled: false
+  bot_token: "YOUR_TELEGRAM_BOT_TOKEN"
+  chat_id: "YOUR_CHAT_ID"
