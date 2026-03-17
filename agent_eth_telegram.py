@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Dict
 
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -26,7 +27,39 @@ PENDING_PROPOSALS: Dict[str, BuyProposal] = {}
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("agent_eth V3-light sẵn sàng.")
+    settings = Settings.load()
+    now_utc = datetime.now(timezone.utc)
+    text = (
+        "[agent_eth] Bot V3-light đang chạy.\n"
+        f"Thời gian UTC: {now_utc:%Y-%m-%d %H:%M:%S}\n"
+        f"Symbol: {settings.symbol}, C0: {settings.initial_capital_usdt:.2f} USDT\n"
+        "Dùng /settings để chỉnh cấu hình, /config để xem trạng thái chi tiết."
+    )
+    await update.message.reply_text(text)
+
+
+async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    settings = Settings.load()
+    state = State.load(settings)
+    now_utc = datetime.now(timezone.utc)
+
+    text = (
+        "[agent_eth – CONFIG]\n"
+        f"UTC now: {now_utc:%Y-%m-%d %H:%M:%S}\n"
+        f"Symbol: {settings.symbol}\n"
+        f"Vốn ban đầu (C0): {settings.initial_capital_usdt:.2f} USDT\n"
+        f"Giới hạn ngày: ±{settings.daily_limit_pct:.1f}% "
+        f"(= ±{settings.daily_limit_usdt:.2f} USDT)\n"
+        f"Max lệnh/ngày: {settings.max_trades_per_day}\n"
+        f"TP: {settings.tp_pct_min:.1f}–{settings.tp_pct_max:.1f}% | "
+        f"SL: {settings.sl_pct:.1f}%\n"
+        f"Dump threshold 5m: {settings.dump_threshold_pct:.2f}%\n"
+        f"P&L ngày hiện tại: {state.pnl_day_usdt:.4f} USDT "
+        f"(trades mở/đóng: {state.trades_opened}/{state.trades_closed})\n"
+        f"Đang có vị thế: {'YES' if state.has_position else 'NO'}\n"
+    )
+
+    await update.message.reply_text(text)
 
 
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -237,6 +270,7 @@ def build_application() -> Application:
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("settings", cmd_settings))
+    app.add_handler(CommandHandler("config", cmd_config))
 
     app.add_handler(
         CallbackQueryHandler(handle_settings_callback, pattern=r"^SET:")

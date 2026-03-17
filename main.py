@@ -188,6 +188,15 @@ async def main_loop() -> None:
                 "enableRateLimit": True,
             }
         )
+        # Gửi thông báo khởi động tới chat
+        await app.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "[agent_eth] Bot V3-light đã khởi động.\n"
+                f"Thời gian UTC: {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}\n"
+                f"Symbol: {settings.symbol}, poll={poll_interval}s, data=Binance."
+            ),
+        )
         logger.info(
             "agent_eth V3-light loop started (symbol=%s, poll=%ss, data=Binance).",
             settings.symbol,
