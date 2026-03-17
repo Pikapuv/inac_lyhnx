@@ -15,6 +15,10 @@ from binance_client import BinanceReadClient
 pnl_today_usdt = 0.0
 last_reset_date: str | None = None
 
+# V1.5 state: vị thế ước tính (dựa trên tín hiệu)
+has_position = False
+current_entry_price: float | None = None
+
 
 def load_config(path: str = "config.yaml") -> dict:
     p = Path(path)
@@ -77,7 +81,7 @@ def main():
     )
 
     startup = (
-        "[agent_eth] Bot V1/V2 khởi động\n"
+        "[agent_eth] Bot V1.5/V2 khởi động\n"
         f"Sàn: Binance, cặp: {symbol}\n"
         f"Chu kỳ quét: {poll_interval:.0f}s/lần\n"
         f"Rule: vốn {capital:.2f} USDT, {capital*position_pct:.2f} USDT/lệnh, "
@@ -88,7 +92,7 @@ def main():
 
     history: list[tuple[float, float]] = []
 
-    global pnl_today_usdt, last_reset_date
+    global pnl_today_usdt, last_reset_date, has_position, current_entry_price
 
     while True:
         try:
@@ -108,6 +112,8 @@ def main():
             if last_reset_date is None or last_reset_date != today_str:
                 last_reset_date = today_str
                 pnl_today_usdt = 0.0
+                has_position = False
+                current_entry_price = None
 
             # Đọc balance spot (V2 skeleton)
             bal = bread.get_spot_balance()
@@ -120,8 +126,8 @@ def main():
 
             # Nếu đã đủ dữ liệu
             if change_short is not None and change_long is not None:
-                # Dump vừa phải, dễ test hơn
-                if change_short <= -0.3:
+                # --- Nhánh MUA: chỉ khi CHƯA có vị thế ước tính ---
+                if (not has_position) and change_short <= -0.3:
                     size_usdt = capital * position_pct
                     size_eth = size_usdt / price
                     entry = price
@@ -135,7 +141,7 @@ def main():
                         f"Thay đổi 5p: {change_short:.2f}% | 15p: {change_long:.2f}%\n\n"
                         f"Vốn tham chiếu: {capital:.2f} USDT\n"
                         f"Size gợi ý (25% vốn): {size_usdt:.2f} USDT (~{size_eth:.6f} ETH)\n\n"
-                        "Kế hoạch giá (V1):\n"
+                        "Kế hoạch giá (V1.5):\n"
                         f"- Entry quanh: {entry:.2f} USDT\n"
                         f"- TP1 (+{tp_min:.0f}%): {tp1:.2f} USDT\n"
                         f"- TP2 (+{tp_max:.0f}%): {tp2:.2f} USDT\n"
@@ -145,6 +151,29 @@ def main():
                     )
                     print(msg)
                     notify_telegram(tg_token, tg_chat_id, msg)
+
+                    # Cập nhật trạng thái vị thế ước tính
+                    has_position = True
+                    current_entry_price = entry
+
+                # --- Nhánh CHỐT LỜI: chỉ khi đang có vị thế ước tính ---
+                if has_position and current_entry_price is not None:
+                    entry = current_entry_price
+                    pnl_pct = (price - entry) / entry * 100.0
+
+                    # Nếu đạt TP1 (>= tp_min)
+                    if pnl_pct >= tp_min:
+                        tp_msg = (
+                            "[agent_eth – CÂN NHẮC CHỐT LỜI]\n"
+                            f"Entry ước tính: {entry:.2f} USDT\n"
+                            f"Giá hiện tại: {price:.2f} USDT\n"
+                            f"Lãi ước tính: {pnl_pct:.2f}%\n\n"
+                            f"Kế hoạch ban đầu: TP1 {tp_min:.0f}–TP2 {tp_max:.0f}%\n"
+                            f"Gợi ý: cân nhắc đặt lệnh bán một phần/toàn bộ quanh vùng hiện tại.\n"
+                        )
+                        print(tp_msg)
+                        notify_telegram(tg_token, tg_chat_id, tp_msg)
+                        # Lưu ý: V1.5 chỉ nhắc, không reset has_position; bạn tự quyết định khi nào thoát
 
         except KeyboardInterrupt:
             print("\n[agent_eth] Stopped by user.")
