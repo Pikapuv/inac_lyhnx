@@ -1,11 +1,19 @@
 import time
 import yaml
 from pathlib import Path
+from datetime import datetime
 
 import ccxt
 import requests
 
 from typing import Dict
+
+from binance_client import BinanceReadClient
+
+
+# V2 state: simple PnL tracking (skeleton)
+pnl_today_usdt = 0.0
+last_reset_date: str | None = None
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -59,8 +67,14 @@ def main():
     tg_token = tcfg.get("bot_token", "")
     tg_chat_id = tcfg.get("chat_id", "")
 
-    # Binance public client
+    # Binance public client (price)
     ex = ccxt.binance({"enableRateLimit": True})
+
+    # Binance read client (balances, trades) - V2 skeleton
+    bread = BinanceReadClient(
+        api_key=cfg["binance_read"]["apiKey"],
+        secret=cfg["binance_read"]["secret"],
+    )
 
     startup = (
         "[agent_eth] Bot V1/V2 khởi động\n"
@@ -74,6 +88,8 @@ def main():
 
     history: list[tuple[float, float]] = []
 
+    global pnl_today_usdt, last_reset_date
+
     while True:
         try:
             # Lấy giá hiện tại
@@ -83,6 +99,17 @@ def main():
             history.append((ts, price))
             cutoff = ts - 30 * 60
             history = [(t0, p0) for (t0, p0) in history if t0 >= cutoff]
+
+            # Reset P&L theo ngày (skeleton)
+            today_str = datetime.utcnow().strftime("%Y-%m-%d")
+            if last_reset_date is None or last_reset_date != today_str:
+                last_reset_date = today_str
+                pnl_today_usdt = 0.0
+
+            # Đọc balance spot (V2 skeleton)
+            bal = bread.get_spot_balance()
+            eth_bal = bal["ETH"]
+            usdt_bal = bal["USDT"]
 
             # Tính % thay đổi 5 phút và 15 phút
             change_short = compute_change(history, 5)
@@ -110,6 +137,8 @@ def main():
                         f"- TP1 (+{tp_min:.0f}%): {tp1:.2f} USDT\n"
                         f"- TP2 (+{tp_max:.0f}%): {tp2:.2f} USDT\n"
                         f"- SL (-{sl_pct:.0f}%): {sl:.2f} USDT\n"
+                        f"- Balance hiện tại: {eth_bal:.6f} ETH, {usdt_bal:.2f} USDT\n"
+                        f"- PnL hôm nay (ước tính): {pnl_today_usdt:.4f} USDT\n"
                     )
                     print(msg)
                     notify_telegram(tg_token, tg_chat_id, msg)
