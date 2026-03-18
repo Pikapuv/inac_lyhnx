@@ -16,6 +16,7 @@ from agent_eth_strategy import (
     MarketSnapshot,
     build_buy_proposal,
     check_tp_sl_time_stop,
+    score_buy_signal,
 )
 from agent_eth_telegram import (
     build_application,
@@ -23,6 +24,7 @@ from agent_eth_telegram import (
     send_tp_sl_time_stop_message,
     expire_pending_proposal,
 )
+from agent_eth_state import state_path_for_symbol
 
 
 logging.basicConfig(
@@ -30,6 +32,41 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s – %(message)s",
 )
 logger = logging.getLogger("agent_eth")
+
+def _fmt_num(x: float | None, digits: int = 4) -> str:
+    if x is None:
+        return "n/a"
+    try:
+        return f"{float(x):.{digits}f}"
+    except Exception:
+        return "n/a"
+
+
+def _render_market_table(rows: List[Dict[str, str]]) -> str:
+    """
+    Render a simple fixed-width table for logs.
+    rows: [{"symbol": "...", "price": "...", "chg5m": "...", "chg1h": "..."}]
+    """
+    headers = ["SYMBOL", "PRICE", "CHG_5M", "CHG_1H"]
+    data = [
+        [r.get("symbol", ""), r.get("price", ""), r.get("chg5m", ""), r.get("chg1h", "")]
+        for r in rows
+    ]
+    widths = [len(h) for h in headers]
+    for row in data:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def line(sep: str = "-") -> str:
+        return "+" + "+".join((sep * (w + 2)) for w in widths) + "+"
+
+    def fmt_row(cells: List[str]) -> str:
+        return "| " + " | ".join(cells[i].ljust(widths[i]) for i in range(len(widths))) + " |"
+
+    out = [line("-"), fmt_row(headers), line("=")]
+    out.extend(fmt_row(r) for r in data)
+    out.append(line("-"))
+    return "\n".join(out)
 
 
 def _split_symbol(symbol: str) -> tuple[str, str]:
@@ -326,7 +363,6 @@ async def main_loop() -> None:
 
         cfg = load_config()
         settings = Settings.load()
-        state = State.load(settings)
 
         poll_interval = load_config_poll_interval(default_seconds=30)
 
@@ -342,157 +378,206 @@ async def main_loop() -> None:
             }
         )
         # Gửi thông báo khởi động tới chat
+        symbols = settings.effective_symbols()
         await app.bot.send_message(
             chat_id=chat_id,
             text=(
                 "[agent_eth] Bot V3-light đã khởi động.\n"
                 f"Thời gian UTC: {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())}\n"
-                f"Symbol: {settings.symbol}, poll={poll_interval}s, data=Binance."
+                f"Symbols: {', '.join(symbols)}, poll={poll_interval}s, data=Binance."
             ),
         )
         logger.info(
-            "agent_eth V3-light loop started (symbol=%s, poll=%ss, data=Binance).",
-            settings.symbol,
+            "agent_eth V3-light loop started (symbols=%s, poll=%ss, data=Binance).",
+            ",".join(symbols),
             poll_interval,
         )
 
         try:
             while True:
                 settings = Settings.load()
-                state = State.load(settings)
+                symbols = settings.effective_symbols()
+                table_rows: List[Dict[str, str]] = []
 
-                mkt = await fetch_market_snapshot_from_binance(ex, settings)
-
-                # Sync position open/close from Binance trades (auto tracking)
-                if state.has_position:
-                    async def notify_message(text: str) -> None:
-                        await app.bot.send_message(chat_id=chat_id, text=text)
-
-                    await sync_position_from_binance_trades(
-                        ex, settings, state, notify_message=notify_message
-                    )
-                    # Reload state because sync_position may close the position
-                    state = State.load(settings)
-
-                # Daily risk lock + notify once
-                if (
-                    state.auto_trade_enabled
-                    and not state.daily_limit_notified
-                    and abs(state.pnl_day_usdt) >= state.daily_limit_usdt
-                ):
-                    state.daily_limit_reached = True
-                    state.daily_limit_notified = True
-                    state.save()
-                    await app.bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            "[agent_eth] Chạm giới hạn P&L/ngày.\n"
-                            f"P&L ngày: {state.pnl_day_usdt:.4f} USDT "
-                            f"(limit ±{state.daily_limit_usdt:.4f}).\n"
-                            "Tạm dừng tạo tín hiệu BUY cho tới khi sang ngày mới (UTC)."
-                        ),
-                    )
-
-                symbol_key = settings.symbol.replace("/", "")
-                price_now = mkt.prices.get(symbol_key)
-                change_5m_main = mkt.changes_5m.get(symbol_key)
-                logger.info(
-                    "Tick: %s price=%.4f change_5m=%s",
-                    settings.symbol,
-                    price_now if price_now is not None else -1.0,
-                    f"{change_5m_main:.3f}%" if change_5m_main is not None else "n/a",
-                )
-
-                if not state.has_position:
-                    ttl_just_expired = False
-                    # Nếu đang có pending proposal và chưa hết hạn -> không sinh thêm tín hiệu
+                # Global rule: scan many coins but only ONE trade at a time.
+                any_open_position = False
+                any_pending_active = False
+                now_ts = time.time()
+                for sym in symbols:
+                    s2 = Settings.load()
+                    s2.symbol = sym
+                    st = State.load(s2)
+                    if st.has_position:
+                        any_open_position = True
                     if (
-                        state.pending_proposal_id
-                        and state.pending_proposal_ts is not None
-                        and time.time() - state.pending_proposal_ts
-                        < settings.proposal_ttl_seconds
+                        st.pending_proposal_id
+                        and st.pending_proposal_ts is not None
+                        and now_ts - st.pending_proposal_ts < s2.proposal_ttl_seconds
                     ):
-                        await asyncio.sleep(0)  # yield
-                        continue
+                        any_pending_active = True
+                best_candidate: Dict[str, object] | None = None
+                best_state: State | None = None
+                best_state_path = None
 
-                    # Nếu pending đã hết hạn mà user chưa ENTER/SKIP
-                    if state.pending_proposal_id and state.pending_proposal_ts is not None:
+                for sym in symbols:
+                    sym_settings = Settings.load()
+                    sym_settings.symbol = sym
+                    state = State.load(sym_settings)
+                    state_path = state_path_for_symbol(sym)
+
+                    mkt = await fetch_market_snapshot_from_binance(ex, sym_settings)
+
+                    # Sync position open/close from Binance trades (auto tracking)
+                    if state.has_position:
+                        async def notify_message(text: str) -> None:
+                            await app.bot.send_message(chat_id=chat_id, text=text)
+
+                        await sync_position_from_binance_trades(
+                            ex, sym_settings, state, notify_message=notify_message
+                        )
+                        # Reload state because sync_position may close the position
+                        state = State.load(sym_settings)
+
+                    # Daily risk lock + notify once (per symbol)
+                    if (
+                        state.auto_trade_enabled
+                        and not state.daily_limit_notified
+                        and abs(state.pnl_day_usdt) >= state.daily_limit_usdt
+                    ):
+                        state.daily_limit_reached = True
+                        state.daily_limit_notified = True
+                        state.save(state_path)
+                        await app.bot.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                f"[agent_eth] {sym} chạm giới hạn P&L/ngày.\n"
+                                f"P&L ngày: {state.pnl_day_usdt:.4f} USDT "
+                                f"(limit ±{state.daily_limit_usdt:.4f}).\n"
+                                "Tạm dừng tạo tín hiệu BUY cho tới khi sang ngày mới (UTC)."
+                            ),
+                        )
+
+                    symbol_key = sym_settings.symbol.replace("/", "")
+                    price_now = mkt.prices.get(symbol_key)
+                    change_5m_main = mkt.changes_5m.get(symbol_key)
+                    change_1h_main = mkt.changes_1h.get(symbol_key)
+
+                    table_rows.append(
+                        {
+                            "symbol": sym_settings.symbol,
+                            "price": _fmt_num(price_now, digits=4),
+                            "chg5m": f"{_fmt_num(change_5m_main, digits=3)}%" if change_5m_main is not None else "n/a",
+                            "chg1h": f"{_fmt_num(change_1h_main, digits=3)}%" if change_1h_main is not None else "n/a",
+                        }
+                    )
+                    logger.info(
+                        "Tick: %s price=%.4f change_5m=%s",
+                        sym_settings.symbol,
+                        price_now if price_now is not None else -1.0,
+                        f"{change_5m_main:.3f}%" if change_5m_main is not None else "n/a",
+                    )
+
+                    if not state.has_position:
+                        ttl_just_expired = False
+                        # Nếu đang có pending proposal và chưa hết hạn -> không sinh thêm tín hiệu
                         if (
-                            time.time()
-                            - state.pending_proposal_ts
-                            >= settings.proposal_ttl_seconds
+                            state.pending_proposal_id
+                            and state.pending_proposal_ts is not None
+                            and time.time() - state.pending_proposal_ts
+                            < sym_settings.proposal_ttl_seconds
                         ):
-                            # Proposal hết hạn: gỡ khỏi bộ nhớ để user không thể ENTER/SKIP muộn
-                            expire_pending_proposal(state.pending_proposal_id)
-                            await app.bot.send_message(
-                                chat_id=chat_id,
-                                text=(
-                                    f"[agent_eth] Tín hiệu BUY đã qua thời gian chờ "
-                                    f"({settings.proposal_ttl_seconds}s). "
-                                    f"Kiểm tra lại tín hiệu mới..."
-                                ),
-                            )
-                            state.pending_proposal_id = None
-                            state.pending_proposal_ts = None
-                            state.save()
-                            ttl_just_expired = True
+                            await asyncio.sleep(0)  # yield
+                            continue
 
-                    # Sinh tín hiệu mới nếu entry mode ON và không còn pending
-                    if state.auto_trade_enabled and not state.pending_proposal_id:
-                        proposal = build_buy_proposal(settings, state, mkt)
-                        if proposal:
-                            state.pending_proposal_id = proposal.id
-                            state.pending_proposal_ts = time.time()
-                            state.save()
-
-                            logger.info(
-                                "BUY proposal generated at price %.4f",
-                                proposal.price,
-                            )
-                            await send_buy_proposal_message(app, chat_id, proposal)
-                        else:
-                            # Không có tín hiệu mới tại thời điểm check
-                            if ttl_just_expired:
+                        # Nếu pending đã hết hạn mà user chưa ENTER/SKIP
+                        if state.pending_proposal_id and state.pending_proposal_ts is not None:
+                            if (
+                                time.time()
+                                - state.pending_proposal_ts
+                                >= sym_settings.proposal_ttl_seconds
+                            ):
+                                # Proposal hết hạn: gỡ khỏi bộ nhớ để user không thể ENTER/SKIP muộn
+                                expire_pending_proposal(state.pending_proposal_id)
                                 await app.bot.send_message(
                                     chat_id=chat_id,
-                                    text="[agent_eth] Không thấy tín hiệu phù hợp tại thời điểm này. Chờ tín hiệu mới...",
+                                    text=(
+                                        f"[agent_eth] {sym} – Tín hiệu BUY đã qua thời gian chờ "
+                                        f"({sym_settings.proposal_ttl_seconds}s). "
+                                        f"Kiểm tra lại tín hiệu mới..."
+                                    ),
                                 )
-                    elif not state.auto_trade_enabled:
-                        logger.info(
-                            "Entry paused: skip BUY proposal generation."
-                        )
+                                state.pending_proposal_id = None
+                                state.pending_proposal_ts = None
+                                state.save(state_path)
+                                ttl_just_expired = True
 
-                symbol_key = settings.symbol.replace("/", "")
-                price_now = mkt.prices.get(symbol_key)
-                if price_now is not None:
-                    alerts = check_tp_sl_time_stop(
-                        settings, state, price_now, mkt.ts
-                    )
-                    pnl_pct = alerts.get("pnl_pct")
+                        # Global pick-best logic:
+                        # - Scan all symbols
+                        # - Only create ONE proposal (best score) when:
+                        #   * no open position anywhere
+                        #   * no active pending proposal anywhere
+                        if (
+                            (not any_open_position)
+                            and (not any_pending_active)
+                            and state.auto_trade_enabled
+                            and (not state.pending_proposal_id)
+                        ):
+                            proposal = build_buy_proposal(sym_settings, state, mkt)
+                            if proposal:
+                                score = score_buy_signal(sym_settings, mkt)
+                                if score is None:
+                                    score = 0.0
+                                if (best_candidate is None) or (float(score) > float(best_candidate["score"])):  # type: ignore[index]
+                                    best_candidate = {"proposal": proposal, "score": float(score), "sym": sym}
+                                    best_state = state
+                                    best_state_path = state_path
+                        elif not state.auto_trade_enabled:
+                            logger.info("Entry paused: skip BUY proposal generation (%s).", sym)
 
-                    if alerts.get("tp_alert") and pnl_pct is not None:
-                        logger.info("TP alert at %.2f%%", pnl_pct)
-                        await send_tp_sl_time_stop_message(
-                            app, chat_id, "TP", pnl_pct
+                    price_now = mkt.prices.get(symbol_key)
+                    if price_now is not None:
+                        alerts = check_tp_sl_time_stop(
+                            sym_settings, state, price_now, mkt.ts
                         )
-                        state.tp_alert_sent = True
-                        state.save()
+                        pnl_pct = alerts.get("pnl_pct")
 
-                    if alerts.get("sl_alert") and pnl_pct is not None:
-                        logger.info("SL alert at %.2f%%", pnl_pct)
-                        await send_tp_sl_time_stop_message(
-                            app, chat_id, "SL", pnl_pct
-                        )
-                        state.sl_alert_sent = True
-                        state.save()
+                        if alerts.get("tp_alert") and pnl_pct is not None:
+                            logger.info("TP alert %s at %.2f%%", sym, pnl_pct)
+                            await send_tp_sl_time_stop_message(
+                                app, chat_id, sym, "TP", pnl_pct
+                            )
+                            state.tp_alert_sent = True
+                            state.save(state_path)
 
-                    if alerts.get("time_stop_alert") and pnl_pct is not None:
-                        logger.info("TIME-STOP alert at %.2f%%", pnl_pct)
-                        await send_tp_sl_time_stop_message(
-                            app, chat_id, "TIME", pnl_pct
-                        )
-                        state.time_stop_alert_sent = True
-                        state.save()
+                        if alerts.get("sl_alert") and pnl_pct is not None:
+                            logger.info("SL alert %s at %.2f%%", sym, pnl_pct)
+                            await send_tp_sl_time_stop_message(
+                                app, chat_id, sym, "SL", pnl_pct
+                            )
+                            state.sl_alert_sent = True
+                            state.save(state_path)
+
+                        if alerts.get("time_stop_alert") and pnl_pct is not None:
+                            logger.info("TIME-STOP alert %s at %.2f%%", sym, pnl_pct)
+                            await send_tp_sl_time_stop_message(
+                                app, chat_id, sym, "TIME", pnl_pct
+                            )
+                            state.time_stop_alert_sent = True
+                            state.save(state_path)
+
+                # After scanning all coins: emit ONLY ONE best proposal.
+                if best_candidate and best_state and best_state_path:
+                    proposal = best_candidate["proposal"]  # type: ignore[index]
+                    score = float(best_candidate["score"])  # type: ignore[index]
+                    best_state.pending_proposal_id = proposal.id
+                    best_state.pending_proposal_ts = time.time()
+                    best_state.save(best_state_path)
+                    logger.info("BEST BUY proposal picked: %s score=%.4f", best_candidate.get("sym"), score)
+                    await send_buy_proposal_message(app, chat_id, proposal)  # type: ignore[arg-type]
+
+                # One compact table per scan cycle (all symbols)
+                if table_rows:
+                    logger.info("Market snapshot (last scan):\n%s", _render_market_table(table_rows))
 
                 await asyncio.sleep(poll_interval)
         finally:

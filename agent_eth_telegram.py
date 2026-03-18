@@ -16,7 +16,7 @@ from telegram.ext import (
 )
 
 from agent_eth_settings import Settings
-from agent_eth_state import State
+from agent_eth_state import State, state_path_for_symbol
 from agent_eth_strategy import BuyProposal
 
 
@@ -34,16 +34,19 @@ def expire_pending_proposal(proposal_id: str) -> None:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = Settings.load()
     now_utc = datetime.now(timezone.utc)
-    state = State.load(settings)
-
-    # /start mặc định bật chế độ vào lệnh (resume entry).
-    state.auto_trade_enabled = True
-    state.save()
+    # /start: bật entry cho tất cả symbols
+    for sym in settings.effective_symbols():
+        s2 = Settings.load()
+        s2.symbol = sym
+        st = State.load(s2)
+        st.auto_trade_enabled = True
+        st.save(state_path_for_symbol(sym))
 
     text = (
         "[agent_eth] Bot V3-light đang chạy.\n"
         f"Thời gian UTC: {now_utc:%Y-%m-%d %H:%M:%S}\n"
-        f"Symbol: {settings.symbol}, C0: {settings.initial_capital_usdt:.2f} USDT\n"
+        f"Symbols: {', '.join(settings.effective_symbols())}\n"
+        f"C0: {settings.initial_capital_usdt:.2f} USDT\n"
         "Dùng /settings để chỉnh cấu hình, /status để xem trạng thái, /config để xem chi tiết."
     )
     keyboard = [
@@ -77,9 +80,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_stopentry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = Settings.load()
-    state = State.load(settings)
-    state.auto_trade_enabled = False
-    state.save()
+    for sym in settings.effective_symbols():
+        s2 = Settings.load()
+        s2.symbol = sym
+        st = State.load(s2)
+        st.auto_trade_enabled = False
+        st.pending_proposal_id = None
+        st.pending_proposal_ts = None
+        st.save(state_path_for_symbol(sym))
 
     now_utc = datetime.now(timezone.utc)
     await update.message.reply_text(
@@ -89,21 +97,22 @@ async def cmd_stopentry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = Settings.load()
-    state = State.load(settings)
     now_utc = datetime.now(timezone.utc)
-
-    daily_limit = state.daily_limit_usdt
-    entry_mode = "ON" if state.auto_trade_enabled else "OFF"
-
-    text = (
-        "[agent_eth – STATUS]\n"
-        f"UTC now: {now_utc:%Y-%m-%d %H:%M:%S}\n"
-        f"Entry mode: {entry_mode}\n"
-        f"Symbol: {settings.symbol}\n"
-        f"Daily P&L: {state.pnl_day_usdt:.4f} USDT (limit ±{daily_limit:.4f})\n"
-        f"Trades opened/closed: {state.trades_opened}/{state.trades_closed}\n"
-        f"Has position: {'YES' if state.has_position else 'NO'}\n"
-    )
+    lines = [
+        "[agent_eth – STATUS]",
+        f"UTC now: {now_utc:%Y-%m-%d %H:%M:%S}",
+    ]
+    for sym in settings.effective_symbols():
+        s2 = Settings.load()
+        s2.symbol = sym
+        st = State.load(s2)
+        daily_limit = st.daily_limit_usdt
+        entry_mode = "ON" if st.auto_trade_enabled else "OFF"
+        lines.append(
+            f"\n- {sym} | Entry: {entry_mode} | P&L: {st.pnl_day_usdt:.4f} USDT (±{daily_limit:.4f}) "
+            f"| Trades: {st.trades_opened}/{st.trades_closed} | Pos: {'YES' if st.has_position else 'NO'}"
+        )
+    text = "\n".join(lines)
 
     await update.message.reply_text(text)
 
@@ -117,20 +126,24 @@ async def handle_entry_toggle(
 
     _, _, value = data.partition(":")
     settings = Settings.load()
-    state = State.load(settings)
 
     if value == "ON":
-        state.auto_trade_enabled = True
         msg = "Đã resume entry (bật tạo tín hiệu BUY)."
     else:
-        state.auto_trade_enabled = False
         msg = "Đã pause entry (tắt tạo tín hiệu BUY)."
 
-    # Khi pause entry thì xóa proposal pending để tránh bấm nhầm.
-    if not state.auto_trade_enabled:
+    # Apply to all symbols.
+    for sym in settings.effective_symbols():
+        s2 = Settings.load()
+        s2.symbol = sym
+        st = State.load(s2)
+        st.auto_trade_enabled = (value == "ON")
+        if not st.auto_trade_enabled:
+            st.pending_proposal_id = None
+            st.pending_proposal_ts = None
+        st.save(state_path_for_symbol(sym))
+    if value != "ON":
         PENDING_PROPOSALS.clear()
-
-    state.save()
     await query.edit_message_text(
         f"[agent_eth] {msg}", reply_markup=None
     )
@@ -138,13 +151,12 @@ async def handle_entry_toggle(
 
 async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = Settings.load()
-    state = State.load(settings)
     now_utc = datetime.now(timezone.utc)
 
     text = (
         "[agent_eth – CONFIG]\n"
         f"UTC now: {now_utc:%Y-%m-%d %H:%M:%S}\n"
-        f"Symbol: {settings.symbol}\n"
+        f"Symbols: {', '.join(settings.effective_symbols())}\n"
         f"Vốn ban đầu (C0): {settings.initial_capital_usdt:.2f} USDT\n"
         f"Giới hạn ngày: ±{settings.daily_limit_pct:.1f}% "
         f"(= ±{settings.daily_limit_usdt:.2f} USDT)\n"
@@ -152,9 +164,6 @@ async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"TP: {settings.tp_pct_min:.1f}–{settings.tp_pct_max:.1f}% | "
         f"SL: {settings.sl_pct:.1f}%\n"
         f"Dump threshold 5m: {settings.dump_threshold_pct:.2f}%\n"
-        f"P&L ngày hiện tại: {state.pnl_day_usdt:.4f} USDT "
-        f"(trades mở/đóng: {state.trades_opened}/{state.trades_closed})\n"
-        f"Đang có vị thế: {'YES' if state.has_position else 'NO'}\n"
     )
 
     await update.message.reply_text(text)
@@ -305,7 +314,10 @@ async def handle_buy_proposal_callback(
         await query.edit_message_text("Proposal đã hết hiệu lực.")
         return
 
-    state = State.load(Settings.load())
+    # Proposal carries symbol; load the corresponding state.
+    s2 = Settings.load()
+    s2.symbol = proposal.symbol
+    state = State.load(s2)
 
     if action == "ENTER":
         state.has_position = True
@@ -320,7 +332,7 @@ async def handle_buy_proposal_callback(
         # Xóa pending proposal vì user đã vào lệnh
         state.pending_proposal_id = None
         state.pending_proposal_ts = None
-        state.save()
+        state.save(state_path_for_symbol(proposal.symbol))
 
         await query.edit_message_text(
             proposal.to_message() + "\n\n[ENTER] Đã vào lệnh (thực hiện tay trên Binance)."
@@ -330,7 +342,7 @@ async def handle_buy_proposal_callback(
         if state.pending_proposal_id == proposal.id:
             state.pending_proposal_id = None
             state.pending_proposal_ts = None
-            state.save()
+            state.save(state_path_for_symbol(proposal.symbol))
         await query.edit_message_text(
             proposal.to_message() + "\n\n[SKIP] Đã bỏ qua cơ hội này."
         )
@@ -345,10 +357,16 @@ async def handle_position_decision_callback(
     data = query.data or ""
     await query.answer()
 
-    action, _, value_str = data.partition(":")
+    # data format: ACTION:SYMBOL:VALUE
+    parts = data.split(":", 2)
+    action = parts[0] if parts else ""
+    symbol = parts[1] if len(parts) >= 2 else ""
+    value_str = parts[2] if len(parts) >= 3 else ""
 
     settings = Settings.load()
-    state = State.load(settings)
+    s2 = Settings.load()
+    s2.symbol = symbol or settings.symbol
+    state = State.load(s2)
 
     if action in {"TP_OK", "SL_OK", "TIME_OK"}:
         if not state.has_position or state.entry_price is None:
@@ -428,18 +446,19 @@ async def send_buy_proposal_message(
 async def send_tp_sl_time_stop_message(
     app: Application,
     chat_id: int,
+    symbol: str,
     kind: str,
     pnl_pct: float,
 ) -> None:
     settings = Settings.load()
     if kind == "TP":
-        text = f"CÂN NHẮC CHỐT LỜI – PnL: {pnl_pct:.2f}%"
+        text = f"{symbol} – CÂN NHẮC CHỐT LỜI – PnL: {pnl_pct:.2f}%"
         if settings.close_on_tp_alert:
             # Winrate-first: ưu tiên chốt ngay ở TP, giảm cơ hội để biến thắng thành thua.
             keyboard = [
                 [
                     InlineKeyboardButton(
-                        "✅ Chốt lời", callback_data=f"TP_OK:{pnl_pct:.4f}"
+                        "✅ Chốt lời", callback_data=f"TP_OK:{symbol}:{pnl_pct:.4f}"
                     ),
                 ]
             ]
@@ -447,35 +466,35 @@ async def send_tp_sl_time_stop_message(
             keyboard = [
                 [
                     InlineKeyboardButton(
-                        "✅ Chốt lời", callback_data=f"TP_OK:{pnl_pct:.4f}"
+                        "✅ Chốt lời", callback_data=f"TP_OK:{symbol}:{pnl_pct:.4f}"
                     ),
                     InlineKeyboardButton(
                         "❌ Giữ tiếp",
-                        callback_data=f"TP_SKIP:{pnl_pct:.4f}",
+                        callback_data=f"TP_SKIP:{symbol}:{pnl_pct:.4f}",
                     ),
                 ]
             ]
     elif kind == "SL":
-        text = f"CÂN NHẮC CẮT LỖ – PnL: {pnl_pct:.2f}%"
+        text = f"{symbol} – CÂN NHẮC CẮT LỖ – PnL: {pnl_pct:.2f}%"
         keyboard = [
             [
                 InlineKeyboardButton(
-                    "✅ Cắt lỗ", callback_data=f"SL_OK:{pnl_pct:.4f}"
+                    "✅ Cắt lỗ", callback_data=f"SL_OK:{symbol}:{pnl_pct:.4f}"
                 ),
                 InlineKeyboardButton(
-                    "❌ Giữ thêm", callback_data=f"SL_SKIP:{pnl_pct:.4f}"
+                    "❌ Giữ thêm", callback_data=f"SL_SKIP:{symbol}:{pnl_pct:.4f}"
                 ),
             ]
         ]
     else:
-        text = "TIME-STOP: Lệnh đã đi ngang quá lâu quanh hòa vốn."
+        text = f"{symbol} – TIME-STOP: Lệnh đã đi ngang quá lâu quanh hòa vốn."
         keyboard = [
             [
                 InlineKeyboardButton(
-                    "✅ Đóng lệnh", callback_data=f"TIME_OK:{pnl_pct:.4f}"
+                    "✅ Đóng lệnh", callback_data=f"TIME_OK:{symbol}:{pnl_pct:.4f}"
                 ),
                 InlineKeyboardButton(
-                    "❌ Bỏ qua", callback_data=f"TIME_SKIP:{pnl_pct:.4f}"
+                    "❌ Bỏ qua", callback_data=f"TIME_SKIP:{symbol}:{pnl_pct:.4f}"
                 ),
             ]
         ]

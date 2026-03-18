@@ -168,6 +168,41 @@ def _is_bullish_candle(ohlcv: List[Tuple[float, float, float, float, float, floa
     return engulfing or hammer
 
 
+def score_buy_signal(settings: Settings, mkt: MarketSnapshot) -> Optional[float]:
+    """
+    Higher score = better "kèo".
+    Score idea (simple + robust):
+      - stronger 1h dip (more negative) => higher score
+      - lower RSI_5m (more oversold) => higher score
+      - bigger volume spike vs avg 1h => higher score
+    Only uses data already fetched in MarketSnapshot.
+    """
+    symbol_key = settings.symbol.replace("/", "")
+
+    change_1h = mkt.changes_1h.get(symbol_key)
+    if change_1h is None:
+        return None
+
+    if not mkt.ohlcv_5m:
+        return None
+    closes_5m = [row[4] for row in mkt.ohlcv_5m]
+    rsi_5m = _rsi(closes_5m, settings.rsi_period)
+    if rsi_5m is None:
+        return None
+
+    vol_5m = mkt.volumes.get(symbol_key)
+    vol_avg_1h = mkt.volumes.get(f"{symbol_key}_AVG1H")
+    if vol_5m is None or vol_avg_1h is None or vol_avg_1h <= 0:
+        return None
+
+    dip_strength = max(0.0, -float(change_1h))  # only count downside
+    rsi_bonus = max(0.0, float(settings.rsi_reversal_threshold_5m) - float(rsi_5m))
+    volume_spike = float(vol_5m) / float(vol_avg_1h)
+
+    # Weighted sum
+    return dip_strength * 0.4 + rsi_bonus * 0.3 + volume_spike * 0.3
+
+
 def build_buy_proposal(
     settings: Settings, state: State, mkt: MarketSnapshot
 ) -> Optional[BuyProposal]:
@@ -246,7 +281,7 @@ def build_buy_proposal(
     tp2 = price_now * (1 + settings.tp_pct_max / 100.0)
     sl = price_now * (1 - settings.sl_pct / 100.0)
 
-    proposal_id = f"{int(mkt.ts)}"
+    proposal_id = f"{symbol_key}-{int(mkt.ts)}"
     return BuyProposal(
         id=proposal_id,
         symbol=settings.symbol,

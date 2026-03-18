@@ -9,7 +9,9 @@ from typing import Dict, Any
 from agent_eth_settings import Settings
 
 
-STATE_PATH = Path(__file__).with_name("state.json")
+def state_path_for_symbol(symbol: str) -> Path:
+    safe = symbol.replace("/", "_").replace(":", "_").replace(" ", "")
+    return Path(__file__).with_name(f"state_{safe}.json")
 
 
 def current_trading_day() -> str:
@@ -63,7 +65,8 @@ class State:
         )
 
     @classmethod
-    def load(cls, settings: Settings, path: Path = STATE_PATH) -> "State":
+    def load(cls, settings: Settings, path: Path | None = None) -> "State":
+        path = path or state_path_for_symbol(settings.symbol)
         if not path.exists():
             state = cls.new_for_day(settings)
             state.save(path)
@@ -108,7 +111,7 @@ class State:
     def to_json(self) -> Dict[str, Any]:
         return asdict(self)
 
-    def save(self, path: Path = STATE_PATH) -> None:
+    def save(self, path: Path) -> None:
         with path.open("w", encoding="utf-8") as f:
             json.dump(self.to_json(), f, ensure_ascii=False, indent=2)
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Iterable
 
 
 SETTINGS_PATH = Path(__file__).with_name("settings.json")
@@ -65,6 +65,8 @@ class Settings:
     cooldown_minutes_after_close: int = 30
 
     symbol: str = "ETH/USDT"
+    # Multi-symbol scanning. If empty/missing, fallback to [symbol].
+    symbols: List[str] | None = None
 
     trading_sessions: List[TradingSession] | None = None
     auto_trade_day: bool = False
@@ -78,10 +80,33 @@ class Settings:
     def default_sessions() -> List[TradingSession]:
         return [TradingSession(start_hour=0, end_hour=23)]
 
+    @staticmethod
+    def _normalize_symbols(symbols: Iterable[str] | None) -> List[str]:
+        if not symbols:
+            return []
+        out: List[str] = []
+        seen: set[str] = set()
+        for s in symbols:
+            if not s:
+                continue
+            s2 = str(s).strip()
+            if not s2:
+                continue
+            if s2 not in seen:
+                out.append(s2)
+                seen.add(s2)
+        return out
+
+    def effective_symbols(self) -> List[str]:
+        syms = self._normalize_symbols(self.symbols)
+        if syms:
+            return syms
+        return [self.symbol]
+
     @classmethod
     def load(cls, path: Path = SETTINGS_PATH) -> "Settings":
         if not path.exists():
-            settings = cls(trading_sessions=cls.default_sessions())
+            settings = cls(trading_sessions=cls.default_sessions(), symbols=["ETH/USDT"])
             settings.save(path)
             return settings
 
@@ -93,6 +118,12 @@ class Settings:
             TradingSession(start_hour=s["start_hour"], end_hour=s["end_hour"])
             for s in sessions_raw
         ]
+
+        symbol = raw.get("symbol", "ETH/USDT")
+        symbols_raw = raw.get("symbols")
+        symbols = cls._normalize_symbols(symbols_raw if symbols_raw is not None else [symbol])
+        if not symbols:
+            symbols = [symbol]
 
         return cls(
             initial_capital_usdt=raw.get("initial_capital_usdt", 20.0),
@@ -129,7 +160,8 @@ class Settings:
             cooldown_minutes_after_close=raw.get(
                 "cooldown_minutes_after_close", 30
             ),
-            symbol=raw.get("symbol", "ETH/USDT"),
+            symbol=symbol,
+            symbols=symbols,
             trading_sessions=sessions or cls.default_sessions(),
             auto_trade_day=raw.get("auto_trade_day", False),
             auto_trade_night=raw.get("auto_trade_night", False),
@@ -141,6 +173,11 @@ class Settings:
             {"start_hour": s.start_hour, "end_hour": s.end_hour}
             for s in (self.trading_sessions or [])
         ]
+        # Ensure symbols is persisted in normalized form.
+        data["symbols"] = self.effective_symbols()
+        # Keep `symbol` consistent (first element).
+        if data["symbols"]:
+            data["symbol"] = data["symbols"][0]
         return data
 
     def save(self, path: Path = SETTINGS_PATH) -> None:
