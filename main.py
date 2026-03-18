@@ -12,6 +12,7 @@ import yaml
 
 from agent_eth_settings import Settings
 from agent_eth_state import State
+from agent_eth_global_state import GlobalState
 from agent_eth_strategy import (
     MarketSnapshot,
     build_buy_proposal,
@@ -25,6 +26,7 @@ from agent_eth_telegram import (
     expire_pending_proposal,
 )
 from agent_eth_state import state_path_for_symbol
+from agent_eth_global_state import GLOBAL_STATE_PATH
 
 
 logging.basicConfig(
@@ -100,7 +102,7 @@ def _format_symbol(symbol: str) -> str:
 async def sync_position_from_binance_trades(
     ex: ccxt.Exchange,
     settings: Settings,
-    state: State,
+    state: State | GlobalState,
     notify_message,
 ) -> None:
     """
@@ -124,7 +126,10 @@ async def sync_position_from_binance_trades(
 
     # Always advance the cursor even if no trades found
     state.last_trade_check_ts = time.time()
-    state.save()
+    if isinstance(state, GlobalState):
+        state.save(GLOBAL_STATE_PATH)
+    else:
+        state.save(state_path_for_symbol(settings.symbol))
 
     if not new_trades:
         return
@@ -152,7 +157,10 @@ async def sync_position_from_binance_trades(
             # size_usdt represents quote spent (approx, excluding fee or including it is small)
             state.size_usdt = buy_cost
             state.size_coin = float(tr.get("amount") or 0.0)
-            state.save()
+            if isinstance(state, GlobalState):
+                state.save(GLOBAL_STATE_PATH)
+            else:
+                state.save(state_path_for_symbol(settings.symbol))
             await notify_message(
                 f"Đã khớp lệnh BUY trên Binance.\n"
                 f"Entry: {state.entry_price:.4f} ({settings.symbol})\n"
@@ -198,7 +206,10 @@ async def sync_position_from_binance_trades(
         state.sl_alert_sent = False
         state.time_stop_alert_sent = False
         state.trades_closed += 1
-        state.save()
+        if isinstance(state, GlobalState):
+            state.save(GLOBAL_STATE_PATH)
+        else:
+            state.save(state_path_for_symbol(settings.symbol))
 
         logger.info("Auto-tracked CLOSE pnl_day_usdt=%.4f (pnl=%.4f)", state.pnl_day_usdt, pnl_usdt)
         label = "CHỐT LỜI" if pnl_usdt >= 0 else "CẮT LỖ"
@@ -363,6 +374,7 @@ async def main_loop() -> None:
 
         cfg = load_config()
         settings = Settings.load()
+        gstate = GlobalState.load(settings)
 
         poll_interval = load_config_poll_interval(default_seconds=30)
 
@@ -398,64 +410,13 @@ async def main_loop() -> None:
                 settings = Settings.load()
                 symbols = settings.effective_symbols()
                 table_rows: List[Dict[str, str]] = []
-
-                # Global rule: scan many coins but only ONE trade at a time.
-                any_open_position = False
-                any_pending_active = False
-                now_ts = time.time()
-                for sym in symbols:
-                    s2 = Settings.load()
-                    s2.symbol = sym
-                    st = State.load(s2)
-                    if st.has_position:
-                        any_open_position = True
-                    if (
-                        st.pending_proposal_id
-                        and st.pending_proposal_ts is not None
-                        and now_ts - st.pending_proposal_ts < s2.proposal_ttl_seconds
-                    ):
-                        any_pending_active = True
+                gstate = GlobalState.load(settings)
                 best_candidate: Dict[str, object] | None = None
-                best_state: State | None = None
-                best_state_path = None
 
                 for sym in symbols:
                     sym_settings = Settings.load()
                     sym_settings.symbol = sym
-                    state = State.load(sym_settings)
-                    state_path = state_path_for_symbol(sym)
-
                     mkt = await fetch_market_snapshot_from_binance(ex, sym_settings)
-
-                    # Sync position open/close from Binance trades (auto tracking)
-                    if state.has_position:
-                        async def notify_message(text: str) -> None:
-                            await app.bot.send_message(chat_id=chat_id, text=text)
-
-                        await sync_position_from_binance_trades(
-                            ex, sym_settings, state, notify_message=notify_message
-                        )
-                        # Reload state because sync_position may close the position
-                        state = State.load(sym_settings)
-
-                    # Daily risk lock + notify once (per symbol)
-                    if (
-                        state.auto_trade_enabled
-                        and not state.daily_limit_notified
-                        and abs(state.pnl_day_usdt) >= state.daily_limit_usdt
-                    ):
-                        state.daily_limit_reached = True
-                        state.daily_limit_notified = True
-                        state.save(state_path)
-                        await app.bot.send_message(
-                            chat_id=chat_id,
-                            text=(
-                                f"[agent_eth] {sym} chạm giới hạn P&L/ngày.\n"
-                                f"P&L ngày: {state.pnl_day_usdt:.4f} USDT "
-                                f"(limit ±{state.daily_limit_usdt:.4f}).\n"
-                                "Tạm dừng tạo tín hiệu BUY cho tới khi sang ngày mới (UTC)."
-                            ),
-                        )
 
                     symbol_key = sym_settings.symbol.replace("/", "")
                     price_now = mkt.prices.get(symbol_key)
@@ -477,101 +438,67 @@ async def main_loop() -> None:
                         f"{change_5m_main:.3f}%" if change_5m_main is not None else "n/a",
                     )
 
-                    if not state.has_position:
-                        ttl_just_expired = False
-                        # Nếu đang có pending proposal và chưa hết hạn -> không sinh thêm tín hiệu
-                        if (
-                            state.pending_proposal_id
-                            and state.pending_proposal_ts is not None
-                            and time.time() - state.pending_proposal_ts
-                            < sym_settings.proposal_ttl_seconds
-                        ):
-                            await asyncio.sleep(0)  # yield
-                            continue
+                    # Proposal picking: only when GLOBAL entry enabled, no global position, no active pending.
+                    if (
+                        gstate.auto_trade_enabled
+                        and (not gstate.has_position)
+                        and (not gstate.pending_proposal_id)
+                    ):
+                        proposal = build_buy_proposal(sym_settings, gstate, mkt)
+                        if proposal:
+                            score = score_buy_signal(sym_settings, mkt) or 0.0
+                            if (best_candidate is None) or (float(score) > float(best_candidate["score"])):  # type: ignore[index]
+                                best_candidate = {
+                                    "proposal": proposal,
+                                    "score": float(score),
+                                    "sym": sym,
+                                }
 
-                        # Nếu pending đã hết hạn mà user chưa ENTER/SKIP
-                        if state.pending_proposal_id and state.pending_proposal_ts is not None:
-                            if (
-                                time.time()
-                                - state.pending_proposal_ts
-                                >= sym_settings.proposal_ttl_seconds
-                            ):
-                                # Proposal hết hạn: gỡ khỏi bộ nhớ để user không thể ENTER/SKIP muộn
-                                expire_pending_proposal(state.pending_proposal_id)
-                                await app.bot.send_message(
-                                    chat_id=chat_id,
-                                    text=(
-                                        f"[agent_eth] {sym} – Tín hiệu BUY đã qua thời gian chờ "
-                                        f"({sym_settings.proposal_ttl_seconds}s). "
-                                        f"Kiểm tra lại tín hiệu mới..."
-                                    ),
-                                )
-                                state.pending_proposal_id = None
-                                state.pending_proposal_ts = None
-                                state.save(state_path)
-                                ttl_just_expired = True
+                # Position management (GLOBAL): check TP/SL/TIME + sync trades for active symbol
+                if gstate.has_position and gstate.active_symbol:
+                    active_settings = Settings.load()
+                    active_settings.symbol = gstate.active_symbol
 
-                        # Global pick-best logic:
-                        # - Scan all symbols
-                        # - Only create ONE proposal (best score) when:
-                        #   * no open position anywhere
-                        #   * no active pending proposal anywhere
-                        if (
-                            (not any_open_position)
-                            and (not any_pending_active)
-                            and state.auto_trade_enabled
-                            and (not state.pending_proposal_id)
-                        ):
-                            proposal = build_buy_proposal(sym_settings, state, mkt)
-                            if proposal:
-                                score = score_buy_signal(sym_settings, mkt)
-                                if score is None:
-                                    score = 0.0
-                                if (best_candidate is None) or (float(score) > float(best_candidate["score"])):  # type: ignore[index]
-                                    best_candidate = {"proposal": proposal, "score": float(score), "sym": sym}
-                                    best_state = state
-                                    best_state_path = state_path
-                        elif not state.auto_trade_enabled:
-                            logger.info("Entry paused: skip BUY proposal generation (%s).", sym)
+                    async def notify_message(text: str) -> None:
+                        await app.bot.send_message(chat_id=chat_id, text=text)
 
-                    price_now = mkt.prices.get(symbol_key)
-                    if price_now is not None:
-                        alerts = check_tp_sl_time_stop(
-                            sym_settings, state, price_now, mkt.ts
-                        )
-                        pnl_pct = alerts.get("pnl_pct")
+                    await sync_position_from_binance_trades(
+                        ex, active_settings, gstate, notify_message=notify_message
+                    )
+                    # Reload after possible close
+                    gstate = GlobalState.load(settings)
 
-                        if alerts.get("tp_alert") and pnl_pct is not None:
-                            logger.info("TP alert %s at %.2f%%", sym, pnl_pct)
-                            await send_tp_sl_time_stop_message(
-                                app, chat_id, sym, "TP", pnl_pct
-                            )
-                            state.tp_alert_sent = True
-                            state.save(state_path)
+                    if gstate.has_position and gstate.active_symbol:
+                        mkt_active = await fetch_market_snapshot_from_binance(ex, active_settings)
+                        symbol_key = active_settings.symbol.replace("/", "")
+                        price_now = mkt_active.prices.get(symbol_key)
+                        if price_now is not None:
+                            alerts = check_tp_sl_time_stop(active_settings, gstate, price_now, mkt_active.ts)
+                            pnl_pct = alerts.get("pnl_pct")
+                            if alerts.get("tp_alert") and pnl_pct is not None:
+                                logger.info("TP alert %s at %.2f%%", active_settings.symbol, pnl_pct)
+                                await send_tp_sl_time_stop_message(app, chat_id, active_settings.symbol, "TP", pnl_pct)
+                                gstate.tp_alert_sent = True
+                                gstate.save(GLOBAL_STATE_PATH)
+                            if alerts.get("sl_alert") and pnl_pct is not None:
+                                logger.info("SL alert %s at %.2f%%", active_settings.symbol, pnl_pct)
+                                await send_tp_sl_time_stop_message(app, chat_id, active_settings.symbol, "SL", pnl_pct)
+                                gstate.sl_alert_sent = True
+                                gstate.save(GLOBAL_STATE_PATH)
+                            if alerts.get("time_stop_alert") and pnl_pct is not None:
+                                logger.info("TIME-STOP alert %s at %.2f%%", active_settings.symbol, pnl_pct)
+                                await send_tp_sl_time_stop_message(app, chat_id, active_settings.symbol, "TIME", pnl_pct)
+                                gstate.time_stop_alert_sent = True
+                                gstate.save(GLOBAL_STATE_PATH)
 
-                        if alerts.get("sl_alert") and pnl_pct is not None:
-                            logger.info("SL alert %s at %.2f%%", sym, pnl_pct)
-                            await send_tp_sl_time_stop_message(
-                                app, chat_id, sym, "SL", pnl_pct
-                            )
-                            state.sl_alert_sent = True
-                            state.save(state_path)
-
-                        if alerts.get("time_stop_alert") and pnl_pct is not None:
-                            logger.info("TIME-STOP alert %s at %.2f%%", sym, pnl_pct)
-                            await send_tp_sl_time_stop_message(
-                                app, chat_id, sym, "TIME", pnl_pct
-                            )
-                            state.time_stop_alert_sent = True
-                            state.save(state_path)
-
-                # After scanning all coins: emit ONLY ONE best proposal.
-                if best_candidate and best_state and best_state_path:
+                # Emit ONLY ONE best proposal globally.
+                if best_candidate and gstate.auto_trade_enabled and (not gstate.has_position) and (not gstate.pending_proposal_id):
                     proposal = best_candidate["proposal"]  # type: ignore[index]
                     score = float(best_candidate["score"])  # type: ignore[index]
-                    best_state.pending_proposal_id = proposal.id
-                    best_state.pending_proposal_ts = time.time()
-                    best_state.save(best_state_path)
+                    gstate.pending_proposal_id = proposal.id
+                    gstate.pending_proposal_symbol = proposal.symbol
+                    gstate.pending_proposal_ts = time.time()
+                    gstate.save(GLOBAL_STATE_PATH)
                     logger.info("BEST BUY proposal picked: %s score=%.4f", best_candidate.get("sym"), score)
                     await send_buy_proposal_message(app, chat_id, proposal)  # type: ignore[arg-type]
 

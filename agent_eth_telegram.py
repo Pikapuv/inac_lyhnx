@@ -16,7 +16,7 @@ from telegram.ext import (
 )
 
 from agent_eth_settings import Settings
-from agent_eth_state import State, state_path_for_symbol
+from agent_eth_global_state import GlobalState, GLOBAL_STATE_PATH
 from agent_eth_strategy import BuyProposal
 
 
@@ -34,20 +34,16 @@ def expire_pending_proposal(proposal_id: str) -> None:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = Settings.load()
     now_utc = datetime.now(timezone.utc)
-    # /start: bật entry cho tất cả symbols
-    for sym in settings.effective_symbols():
-        s2 = Settings.load()
-        s2.symbol = sym
-        st = State.load(s2)
-        st.auto_trade_enabled = True
-        st.save(state_path_for_symbol(sym))
+    st = GlobalState.load(settings)
+    st.auto_trade_enabled = True
+    st.save(GLOBAL_STATE_PATH)
 
     text = (
-        "[agent_eth] Bot V3-light đang chạy.\n"
+        "[agent_eth] Dashboard\n"
         f"Thời gian UTC: {now_utc:%Y-%m-%d %H:%M:%S}\n"
         f"Symbols: {', '.join(settings.effective_symbols())}\n"
-        f"C0: {settings.initial_capital_usdt:.2f} USDT\n"
-        "Dùng /settings để chỉnh cấu hình, /status để xem trạng thái, /config để xem chi tiết."
+        f"C0: {settings.initial_capital_usdt:.2f} USDT | Daily limit: ±{settings.daily_limit_usdt:.2f}\n"
+        f"Entry: {'ON' if st.auto_trade_enabled else 'OFF'} | Pos: {'YES' if st.has_position else 'NO'}"
     )
     keyboard = [
         [
@@ -80,14 +76,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_stopentry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = Settings.load()
-    for sym in settings.effective_symbols():
-        s2 = Settings.load()
-        s2.symbol = sym
-        st = State.load(s2)
-        st.auto_trade_enabled = False
-        st.pending_proposal_id = None
-        st.pending_proposal_ts = None
-        st.save(state_path_for_symbol(sym))
+    st = GlobalState.load(settings)
+    st.auto_trade_enabled = False
+    st.pending_proposal_id = None
+    st.pending_proposal_symbol = None
+    st.pending_proposal_ts = None
+    st.save(GLOBAL_STATE_PATH)
 
     now_utc = datetime.now(timezone.utc)
     await update.message.reply_text(
@@ -97,22 +91,21 @@ async def cmd_stopentry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     settings = Settings.load()
+    st = GlobalState.load(settings)
     now_utc = datetime.now(timezone.utc)
-    lines = [
-        "[agent_eth – STATUS]",
-        f"UTC now: {now_utc:%Y-%m-%d %H:%M:%S}",
-    ]
-    for sym in settings.effective_symbols():
-        s2 = Settings.load()
-        s2.symbol = sym
-        st = State.load(s2)
-        daily_limit = st.daily_limit_usdt
-        entry_mode = "ON" if st.auto_trade_enabled else "OFF"
-        lines.append(
-            f"\n- {sym} | Entry: {entry_mode} | P&L: {st.pnl_day_usdt:.4f} USDT (±{daily_limit:.4f}) "
-            f"| Trades: {st.trades_opened}/{st.trades_closed} | Pos: {'YES' if st.has_position else 'NO'}"
-        )
-    text = "\n".join(lines)
+    entry_mode = "ON" if st.auto_trade_enabled else "OFF"
+    active = st.active_symbol or "n/a"
+    pending = st.pending_proposal_symbol or "n/a"
+    text = (
+        "[agent_eth – STATUS]\n"
+        f"UTC now: {now_utc:%Y-%m-%d %H:%M:%S}\n"
+        f"Symbols: {', '.join(settings.effective_symbols())}\n"
+        f"Entry mode: {entry_mode}\n"
+        f"Active position: {'YES' if st.has_position else 'NO'} ({active})\n"
+        f"Pending proposal: {'YES' if st.pending_proposal_id else 'NO'} ({pending})\n"
+        f"Daily P&L: {st.pnl_day_usdt:.4f} USDT (limit ±{st.daily_limit_usdt:.4f})\n"
+        f"Trades opened/closed: {st.trades_opened}/{st.trades_closed}\n"
+    )
 
     await update.message.reply_text(text)
 
@@ -126,24 +119,20 @@ async def handle_entry_toggle(
 
     _, _, value = data.partition(":")
     settings = Settings.load()
+    st = GlobalState.load(settings)
 
     if value == "ON":
         msg = "Đã resume entry (bật tạo tín hiệu BUY)."
     else:
         msg = "Đã pause entry (tắt tạo tín hiệu BUY)."
 
-    # Apply to all symbols.
-    for sym in settings.effective_symbols():
-        s2 = Settings.load()
-        s2.symbol = sym
-        st = State.load(s2)
-        st.auto_trade_enabled = (value == "ON")
-        if not st.auto_trade_enabled:
-            st.pending_proposal_id = None
-            st.pending_proposal_ts = None
-        st.save(state_path_for_symbol(sym))
-    if value != "ON":
+    st.auto_trade_enabled = (value == "ON")
+    if not st.auto_trade_enabled:
+        st.pending_proposal_id = None
+        st.pending_proposal_symbol = None
+        st.pending_proposal_ts = None
         PENDING_PROPOSALS.clear()
+    st.save(GLOBAL_STATE_PATH)
     await query.edit_message_text(
         f"[agent_eth] {msg}", reply_markup=None
     )
@@ -314,35 +303,38 @@ async def handle_buy_proposal_callback(
         await query.edit_message_text("Proposal đã hết hiệu lực.")
         return
 
-    # Proposal carries symbol; load the corresponding state.
-    s2 = Settings.load()
-    s2.symbol = proposal.symbol
-    state = State.load(s2)
+    settings = Settings.load()
+    st = GlobalState.load(settings)
 
     if action == "ENTER":
-        state.has_position = True
-        state.entry_price = proposal.price
-        state.position_open_time = proposal.ts
-        state.size_usdt = proposal.size_usdt
-        state.size_coin = proposal.size_coin
-        state.tp_alert_sent = False
-        state.sl_alert_sent = False
-        state.time_stop_alert_sent = False
-        state.trades_opened += 1
-        # Xóa pending proposal vì user đã vào lệnh
-        state.pending_proposal_id = None
-        state.pending_proposal_ts = None
-        state.save(state_path_for_symbol(proposal.symbol))
+        if st.has_position:
+            await query.edit_message_text("Bot đang có 1 vị thế mở. Không thể ENTER thêm.")
+            return
+        st.has_position = True
+        st.active_symbol = proposal.symbol
+        st.entry_price = proposal.price
+        st.position_open_time = proposal.ts
+        st.size_usdt = proposal.size_usdt
+        st.size_coin = proposal.size_coin
+        st.tp_alert_sent = False
+        st.sl_alert_sent = False
+        st.time_stop_alert_sent = False
+        st.trades_opened += 1
+        # Clear global pending
+        st.pending_proposal_id = None
+        st.pending_proposal_symbol = None
+        st.pending_proposal_ts = None
+        st.save(GLOBAL_STATE_PATH)
 
         await query.edit_message_text(
             proposal.to_message() + "\n\n[ENTER] Đã vào lệnh (thực hiện tay trên Binance)."
         )
     elif action == "SKIP":
-        # Xóa pending proposal nếu user bỏ qua đúng proposal đó
-        if state.pending_proposal_id == proposal.id:
-            state.pending_proposal_id = None
-            state.pending_proposal_ts = None
-            state.save(state_path_for_symbol(proposal.symbol))
+        if st.pending_proposal_id == proposal.id:
+            st.pending_proposal_id = None
+            st.pending_proposal_symbol = None
+            st.pending_proposal_ts = None
+            st.save(GLOBAL_STATE_PATH)
         await query.edit_message_text(
             proposal.to_message() + "\n\n[SKIP] Đã bỏ qua cơ hội này."
         )
@@ -364,12 +356,10 @@ async def handle_position_decision_callback(
     value_str = parts[2] if len(parts) >= 3 else ""
 
     settings = Settings.load()
-    s2 = Settings.load()
-    s2.symbol = symbol or settings.symbol
-    state = State.load(s2)
+    st = GlobalState.load(settings)
 
     if action in {"TP_OK", "SL_OK", "TIME_OK"}:
-        if not state.has_position or state.entry_price is None:
+        if not st.has_position or st.entry_price is None:
             await query.edit_message_text(
                 "Hiện tại bot không thấy còn vị thế để đóng (có thể đã được auto-tracking)."
             )

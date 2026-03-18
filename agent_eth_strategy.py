@@ -6,6 +6,7 @@ from typing import Dict, Any, Optional, List, Tuple
 
 from agent_eth_settings import Settings
 from agent_eth_state import State
+from agent_eth_global_state import GlobalState
 
 
 @dataclass
@@ -56,7 +57,7 @@ def within_trading_session(settings: Settings, now_utc: datetime) -> bool:
     return False
 
 
-def can_open_new_trade(settings: Settings, state: State, now_ts: float) -> bool:
+def can_open_new_trade(settings: Settings, state: State | GlobalState, now_ts: float) -> bool:
     if state.daily_limit_reached:
         return False
     if abs(state.pnl_day_usdt) >= state.daily_limit_usdt:
@@ -204,7 +205,7 @@ def score_buy_signal(settings: Settings, mkt: MarketSnapshot) -> Optional[float]
 
 
 def build_buy_proposal(
-    settings: Settings, state: State, mkt: MarketSnapshot
+    settings: Settings, state: State | GlobalState, mkt: MarketSnapshot
 ) -> Optional[BuyProposal]:
     now_utc = datetime.fromtimestamp(mkt.ts, tz=timezone.utc)
     now_ts = mkt.ts
