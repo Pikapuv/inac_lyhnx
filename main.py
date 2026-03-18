@@ -234,6 +234,12 @@ def load_config() -> Dict:
     except Exception:
         return {}
 
+def load_config_required() -> Dict:
+    cfg = load_config()
+    if not cfg:
+        raise RuntimeError("Thiếu config.yaml hoặc config.yaml không đọc được.")
+    return cfg
+
 
 def load_config_poll_interval(default_seconds: int = 30) -> int:
     raw = load_config()
@@ -362,18 +368,23 @@ async def fetch_market_snapshot_from_binance(
 
 
 async def main_loop() -> None:
-    chat_id_env = os.environ.get("TELEGRAM_CHAT_ID")
-    if not chat_id_env:
-        raise RuntimeError("Thiếu biến môi trường TELEGRAM_CHAT_ID")
-    chat_id = int(chat_id_env)
+    cfg = load_config_required()
+    telegram_cfg = cfg.get("telegram") or {}
+    token = telegram_cfg.get("bot_token")
+    chat_id_raw = telegram_cfg.get("chat_id")
+    if not token:
+        raise RuntimeError("Thiếu telegram.bot_token trong config.yaml")
+    if not chat_id_raw:
+        raise RuntimeError("Thiếu telegram.chat_id trong config.yaml")
+    chat_id = int(chat_id_raw)
 
-    app = build_application()
+    settings = Settings.from_config(cfg)
+    app = build_application(token=token, settings=settings)
 
     async with app:
         await app.start()
 
-        cfg = load_config()
-        settings = Settings.load()
+        settings = Settings.from_config(cfg)
         gstate = GlobalState.load(settings)
 
         poll_interval = load_config_poll_interval(default_seconds=30)
@@ -382,6 +393,8 @@ async def main_loop() -> None:
         binance_cfg = cfg.get("binance_read") or {}
         api_key = binance_cfg.get("apiKey") or ""
         secret = binance_cfg.get("secret") or ""
+        if not api_key or not secret:
+            raise RuntimeError("Thiếu binance_read.apiKey/secret trong config.yaml")
         ex = ccxt.binance(
             {
                 "apiKey": api_key,
@@ -407,14 +420,15 @@ async def main_loop() -> None:
 
         try:
             while True:
-                settings = Settings.load()
+                cfg = load_config_required()
+                settings = Settings.from_config(cfg)
                 symbols = settings.effective_symbols()
                 table_rows: List[Dict[str, str]] = []
                 gstate = GlobalState.load(settings)
                 best_candidate: Dict[str, object] | None = None
 
                 for sym in symbols:
-                    sym_settings = Settings.load()
+                    sym_settings = Settings.from_config(cfg)
                     sym_settings.symbol = sym
                     mkt = await fetch_market_snapshot_from_binance(ex, sym_settings)
 

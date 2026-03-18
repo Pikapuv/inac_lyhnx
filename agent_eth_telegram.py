@@ -32,7 +32,9 @@ def expire_pending_proposal(proposal_id: str) -> None:
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    settings = Settings.load()
+    settings = context.application.bot_data.get("settings")
+    if not isinstance(settings, Settings):
+        settings = Settings.load()
     now_utc = datetime.now(timezone.utc)
     st = GlobalState.load(settings)
     st.auto_trade_enabled = True
@@ -75,7 +77,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_stopentry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    settings = Settings.load()
+    settings = context.application.bot_data.get("settings")
+    if not isinstance(settings, Settings):
+        settings = Settings.load()
     st = GlobalState.load(settings)
     st.auto_trade_enabled = False
     st.pending_proposal_id = None
@@ -90,7 +94,9 @@ async def cmd_stopentry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    settings = Settings.load()
+    settings = context.application.bot_data.get("settings")
+    if not isinstance(settings, Settings):
+        settings = Settings.load()
     st = GlobalState.load(settings)
     now_utc = datetime.now(timezone.utc)
     entry_mode = "ON" if st.auto_trade_enabled else "OFF"
@@ -118,7 +124,9 @@ async def handle_entry_toggle(
     await query.answer()
 
     _, _, value = data.partition(":")
-    settings = Settings.load()
+    settings = context.application.bot_data.get("settings")
+    if not isinstance(settings, Settings):
+        settings = Settings.load()
     st = GlobalState.load(settings)
 
     if value == "ON":
@@ -139,7 +147,9 @@ async def handle_entry_toggle(
 
 
 async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    settings = Settings.load()
+    settings = context.application.bot_data.get("settings")
+    if not isinstance(settings, Settings):
+        settings = Settings.load()
     now_utc = datetime.now(timezone.utc)
 
     text = (
@@ -159,7 +169,9 @@ async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    settings = Settings.load()
+    settings = context.application.bot_data.get("settings")
+    if not isinstance(settings, Settings):
+        settings = Settings.load()
     text = (
         "[agent_eth – SETTINGS]\n"
         f"Vốn ban đầu: {settings.initial_capital_usdt:.2f} USDT\n"
@@ -237,7 +249,9 @@ async def handle_setting_input(
         return
 
     text = (update.message.text or "").strip()
-    settings = Settings.load()
+    settings = context.application.bot_data.get("settings")
+    if not isinstance(settings, Settings):
+        settings = Settings.load()
     msg_ok = ""
 
     try:
@@ -283,7 +297,9 @@ async def handle_setting_input(
         await update.message.reply_text(f"Giá trị không hợp lệ: {e}")
         return
 
-    settings.save()
+    # Note: in config-only mode, Telegram UI should not persist to settings.json.
+    # We keep runtime-only changes in-memory for this process.
+    context.application.bot_data["settings"] = settings
     context.user_data.pop("await_setting", None)
 
     await update.message.reply_text(msg_ok)
@@ -303,7 +319,9 @@ async def handle_buy_proposal_callback(
         await query.edit_message_text("Proposal đã hết hiệu lực.")
         return
 
-    settings = Settings.load()
+    settings = context.application.bot_data.get("settings")
+    if not isinstance(settings, Settings):
+        settings = Settings.load()
     st = GlobalState.load(settings)
 
     if action == "ENTER":
@@ -355,7 +373,9 @@ async def handle_position_decision_callback(
     symbol = parts[1] if len(parts) >= 2 else ""
     value_str = parts[2] if len(parts) >= 3 else ""
 
-    settings = Settings.load()
+    settings = context.application.bot_data.get("settings")
+    if not isinstance(settings, Settings):
+        settings = Settings.load()
     st = GlobalState.load(settings)
 
     if action in {"TP_OK", "SL_OK", "TIME_OK"}:
@@ -374,12 +394,14 @@ async def handle_position_decision_callback(
         await query.edit_message_text("Đã ghi nhận giữ lệnh.")
 
 
-def build_application() -> Application:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+def build_application(token: str | None = None, settings: Settings | None = None) -> Application:
+    token = token or os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("Thiếu biến môi trường TELEGRAM_BOT_TOKEN")
 
     app = Application.builder().token(token).build()
+    if settings is not None:
+        app.bot_data["settings"] = settings
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -440,7 +462,10 @@ async def send_tp_sl_time_stop_message(
     kind: str,
     pnl_pct: float,
 ) -> None:
-    settings = Settings.load()
+    # Use app-scoped settings when available
+    settings = app.bot_data.get("settings")
+    if not isinstance(settings, Settings):
+        settings = Settings.load()
     if kind == "TP":
         text = f"{symbol} – CÂN NHẮC CHỐT LỜI – PnL: {pnl_pct:.2f}%"
         if settings.close_on_tp_alert:

@@ -103,6 +103,83 @@ class Settings:
             return syms
         return [self.symbol]
 
+    def apply_config_overrides(self, cfg: Dict[str, Any]) -> "Settings":
+        """
+        Override settings from config.yaml (optional).
+        Expected keys:
+          - strategy.symbol / strategy.symbols / strategy.dump_threshold_pct / strategy.pump_threshold_pct
+          - risk.capital_usdt / risk.daily_pnl_limit_pct / risk.max_trades_per_day
+          - risk.max_loss_pct_per_trade / risk.target_profit_pct_min / risk.target_profit_pct_max
+        """
+        strategy = (cfg.get("strategy") or {}) if isinstance(cfg, dict) else {}
+        risk = (cfg.get("risk") or {}) if isinstance(cfg, dict) else {}
+
+        # symbols
+        symbols_raw = strategy.get("symbols")
+        if symbols_raw:
+            self.symbols = self._normalize_symbols(symbols_raw)
+            if self.symbols:
+                self.symbol = self.symbols[0]
+        else:
+            sym = strategy.get("symbol")
+            if sym:
+                self.symbol = str(sym).strip()
+                self.symbols = self._normalize_symbols([self.symbol])
+
+        # thresholds
+        if strategy.get("dump_threshold_pct") is not None:
+            try:
+                self.dump_threshold_pct = float(strategy.get("dump_threshold_pct"))
+            except Exception:
+                pass
+        if strategy.get("pump_threshold_pct") is not None:
+            try:
+                self.pump_threshold_pct = float(strategy.get("pump_threshold_pct"))
+            except Exception:
+                pass
+
+        # risk -> settings mapping
+        if risk.get("capital_usdt") is not None:
+            try:
+                self.initial_capital_usdt = float(risk.get("capital_usdt"))
+            except Exception:
+                pass
+        if risk.get("daily_pnl_limit_pct") is not None:
+            try:
+                self.daily_limit_pct = float(risk.get("daily_pnl_limit_pct"))
+            except Exception:
+                pass
+        if risk.get("max_trades_per_day") is not None:
+            try:
+                self.max_trades_per_day = int(risk.get("max_trades_per_day"))
+            except Exception:
+                pass
+
+        if risk.get("max_loss_pct_per_trade") is not None:
+            try:
+                self.sl_pct = float(risk.get("max_loss_pct_per_trade"))
+            except Exception:
+                pass
+        if risk.get("target_profit_pct_min") is not None:
+            try:
+                self.tp_pct_min = float(risk.get("target_profit_pct_min"))
+            except Exception:
+                pass
+        if risk.get("target_profit_pct_max") is not None:
+            try:
+                self.tp_pct_max = float(risk.get("target_profit_pct_max"))
+            except Exception:
+                pass
+
+        return self
+
+    @classmethod
+    def from_config(cls, cfg: Dict[str, Any]) -> "Settings":
+        """
+        Build Settings purely from config.yaml (no settings.json).
+        """
+        return cls(trading_sessions=cls.default_sessions()).apply_config_overrides(cfg)
+
     @classmethod
     def load(cls, path: Path = SETTINGS_PATH) -> "Settings":
         if not path.exists():
