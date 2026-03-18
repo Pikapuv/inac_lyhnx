@@ -34,17 +34,21 @@ class BuyProposal:
     tp1: float
     tp2: float
     sl: float
+    kind: str = "DIP"  # DIP | BREAKOUT
+    score: float = 0.0
+    reason: str = ""
 
     def to_message(self) -> str:
         dt = datetime.fromtimestamp(self.ts, tz=timezone.utc)
         return (
-            f"[BUY PROPOSAL] {self.symbol}\n"
+            f"[BUY PROPOSAL] {self.symbol} ({self.kind}, score={self.score:.2f})\n"
             f"Thời gian (UTC): {dt:%Y-%m-%d %H:%M:%S}\n"
             f"Giá: {self.price:.4f}\n"
             f"Kích thước: {self.size_usdt:.2f} USDT (~{self.size_coin:.5f})\n"
             f"TP1: {self.tp1:.4f} (+1%)\n"
             f"TP2: {self.tp2:.4f} (+2%)\n"
-            f"SL: {self.sl:.4f} (-2%)"
+            f"SL: {self.sl:.4f} (-2%)\n"
+            f"Lý do: {self.reason}"
         )
 
 
@@ -169,6 +173,188 @@ def _is_bullish_candle(ohlcv: List[Tuple[float, float, float, float, float, floa
     return engulfing or hammer
 
 
+def _trend_metrics_from_ohlcv_5m(
+    settings: Settings,
+    ohlcv_5m: List[Tuple[float, float, float, float, float, float]],
+    now_ts: float,
+    price_now: float,
+) -> Dict[str, Any]:
+    closes_1h = _downsample_5m_to_1h_closes(ohlcv_5m, current_ts=now_ts)
+    ema50 = _ema(closes_1h, settings.ema_trend_period_1h)
+    ema20 = _ema(closes_1h, 20) if len(closes_1h) >= 20 else None
+    trend_ok = (ema50 is not None) and (price_now > ema50)
+    trend_strong = False
+    if ema50 is not None and ema20 is not None:
+        trend_strong = price_now > ema20 > ema50
+    return {"ema50": ema50, "ema20": ema20, "trend_ok": trend_ok, "trend_strong": trend_strong}
+
+
+def _volume_spike(mkt: MarketSnapshot, symbol_key: str) -> Optional[float]:
+    vol_5m = mkt.volumes.get(symbol_key)
+    vol_avg_1h = mkt.volumes.get(f"{symbol_key}_AVG1H")
+    if vol_5m is None or vol_avg_1h is None or vol_avg_1h <= 0:
+        return None
+    return float(vol_5m) / float(vol_avg_1h)
+
+
+def _rsi_5m(settings: Settings, mkt: MarketSnapshot) -> Optional[float]:
+    if not mkt.ohlcv_5m:
+        return None
+    closes_5m = [row[4] for row in mkt.ohlcv_5m]
+    return _rsi(closes_5m, settings.rsi_period)
+
+
+def evaluate_entry_candidate(
+    settings: Settings, state: State | GlobalState, mkt: MarketSnapshot
+) -> Optional[BuyProposal]:
+    """
+    Pro entry:
+    - Hard filters: session, risk/day, trend_ok, avoid-fomo
+    - Two modes compete: DIP vs BREAKOUT
+    - Use scoring + threshold entry_score_min
+    """
+    now_utc = datetime.fromtimestamp(mkt.ts, tz=timezone.utc)
+    now_ts = mkt.ts
+    if not within_trading_session(settings, now_utc):
+        return None
+    if not can_open_new_trade(settings, state, now_ts=now_ts):
+        return None
+
+    symbol_key = settings.symbol.replace("/", "")
+    price_now = mkt.prices.get(symbol_key)
+    if price_now is None or not mkt.ohlcv_5m:
+        return None
+
+    trend = _trend_metrics_from_ohlcv_5m(settings, mkt.ohlcv_5m, now_ts=now_ts, price_now=price_now)
+    if not trend["trend_ok"]:
+        return None
+
+    # Avoid FOMO (still a hard filter for both modes)
+    change_5m = mkt.changes_5m.get(symbol_key)
+    if change_5m is not None and change_5m >= settings.pump_threshold_pct:
+        return None
+
+    rsi_val = _rsi_5m(settings, mkt)
+    vol_spike = _volume_spike(mkt, symbol_key)
+    change_1h = mkt.changes_1h.get(symbol_key)
+
+    # Candle confirmation
+    last_open = mkt.ohlcv_5m[-1][1]
+    last_close = mkt.ohlcv_5m[-1][4]
+    candle_green = last_close > last_open
+
+    candidates: List[BuyProposal] = []
+
+    # --- Mode A: DIP (adaptive thresholds) ---
+    dip_thr_1h = settings.dump_threshold_1h_pct_trend_strong if trend["trend_strong"] else settings.dump_threshold_1h_pct
+    rsi_thr = settings.rsi_reversal_threshold_5m_trend_strong if trend["trend_strong"] else settings.rsi_reversal_threshold_5m
+
+    dip_ok = (change_1h is not None) and (change_1h <= dip_thr_1h)
+    rsi_ok = (rsi_val is not None) and (rsi_val <= rsi_thr)
+    vol_ok = (vol_spike is not None) and (vol_spike >= 1.0)
+
+    dip_score = 0.0
+    dip_reasons: List[str] = []
+    if dip_ok and change_1h is not None:
+        dip_score += min(3.0, abs(float(change_1h))) * 0.8
+        dip_reasons.append(f"dip_1h={change_1h:.2f}%<= {dip_thr_1h:.2f}%")
+    if rsi_ok and rsi_val is not None:
+        dip_score += max(0.0, (rsi_thr - float(rsi_val))) * 0.10
+        dip_reasons.append(f"rsi5m={rsi_val:.1f}<= {rsi_thr:.1f}")
+    if vol_ok and vol_spike is not None:
+        dip_score += min(2.0, float(vol_spike)) * 0.6
+        dip_reasons.append(f"vol_spike={vol_spike:.2f}x")
+    if candle_green:
+        dip_score += 0.3
+        dip_reasons.append("candle=green")
+
+    if dip_score > 0:
+        candidates.append(
+            _proposal_from_price(
+                settings=settings,
+                mkt=mkt,
+                price_now=price_now,
+                kind="DIP",
+                score=dip_score,
+                reason="; ".join(dip_reasons) if dip_reasons else "dip-scan",
+            )
+        )
+
+    # --- Mode B: BREAKOUT ---
+    if settings.breakout_enabled:
+        lookback_bars = max(1, settings.breakout_lookback_hours * 12)
+        highs = [row[2] for row in mkt.ohlcv_5m[-lookback_bars:]]
+        breakout_score = 0.0
+        br_reasons: List[str] = []
+        if len(highs) >= 2:
+            prev_high = max(highs[:-1])  # exclude last candle high
+            buffer = prev_high * (1 + settings.breakout_buffer_pct / 100.0)
+            breakout_ok = last_close > buffer
+            if breakout_ok:
+                breakout_score += 2.0
+                br_reasons.append(f"break>{prev_high:.4f} (+{settings.breakout_buffer_pct:.2f}%)")
+                # Volume confirmation stronger for breakout
+                if vol_spike is not None and vol_spike >= settings.breakout_volume_mult:
+                    breakout_score += min(3.0, vol_spike) * 0.8
+                    br_reasons.append(f"vol_spike={vol_spike:.2f}x>= {settings.breakout_volume_mult:.2f}x")
+                # Candle bullish adds confidence
+                if candle_green:
+                    breakout_score += 0.3
+                    br_reasons.append("candle=green")
+        if breakout_score > 0:
+            candidates.append(
+                _proposal_from_price(
+                    settings=settings,
+                    mkt=mkt,
+                    price_now=price_now,
+                    kind="BREAKOUT",
+                    score=breakout_score,
+                    reason="; ".join(br_reasons) if br_reasons else "breakout-scan",
+                )
+            )
+
+    if not candidates:
+        return None
+
+    best = max(candidates, key=lambda p: p.score)
+    if best.score < settings.entry_score_min:
+        return None
+    return best
+
+
+def _proposal_from_price(
+    settings: Settings,
+    mkt: MarketSnapshot,
+    price_now: float,
+    kind: str,
+    score: float,
+    reason: str,
+) -> BuyProposal:
+    symbol_key = settings.symbol.replace("/", "")
+    c0 = settings.initial_capital_usdt
+    stake_pct = 0.70
+    size_usdt = stake_pct * c0
+    size_coin = size_usdt / price_now
+    tp1 = price_now * (1 + settings.tp_pct_min / 100.0)
+    tp2 = price_now * (1 + settings.tp_pct_max / 100.0)
+    sl = price_now * (1 - settings.sl_pct / 100.0)
+    proposal_id = f"{symbol_key}-{int(mkt.ts)}"
+    return BuyProposal(
+        id=proposal_id,
+        symbol=settings.symbol,
+        price=price_now,
+        ts=mkt.ts,
+        size_usdt=size_usdt,
+        size_coin=size_coin,
+        tp1=tp1,
+        tp2=tp2,
+        sl=sl,
+        kind=kind,
+        score=float(score),
+        reason=reason,
+    )
+
+
 def score_buy_signal(settings: Settings, mkt: MarketSnapshot) -> Optional[float]:
     """
     Higher score = better "kèo".
@@ -207,93 +393,7 @@ def score_buy_signal(settings: Settings, mkt: MarketSnapshot) -> Optional[float]
 def build_buy_proposal(
     settings: Settings, state: State | GlobalState, mkt: MarketSnapshot
 ) -> Optional[BuyProposal]:
-    now_utc = datetime.fromtimestamp(mkt.ts, tz=timezone.utc)
-    now_ts = mkt.ts
-
-    if not within_trading_session(settings, now_utc):
-        return None
-    if not can_open_new_trade(settings, state, now_ts=now_ts):
-        return None
-
-    symbol_key = settings.symbol.replace("/", "")
-    price_now = mkt.prices.get(symbol_key)
-    if price_now is None:
-        return None
-
-    if not mkt.ohlcv_5m:
-        return None
-
-    # Trend filter: EMA50_1h (chỉ dùng 1h đóng đủ từ chuỗi 5m downsample theo hour bucket)
-    closes_1h = _downsample_5m_to_1h_closes(mkt.ohlcv_5m, current_ts=now_ts)
-    ema = _ema(closes_1h, settings.ema_trend_period_1h)
-    if ema is None:
-        return None
-    trend_ok = price_now > ema
-    if not trend_ok:
-        return None
-
-    # Dip (1h): change_1h <= -1.5% (config bằng dump_threshold_1h_pct)
-    change_1h = mkt.changes_1h.get(symbol_key)
-    if change_1h is None or change_1h > settings.dump_threshold_1h_pct:
-        return None
-
-    # Avoid FOMO: nếu 5m đang pump mạnh thì không vào
-    change_5m = mkt.changes_5m.get(symbol_key)
-    if change_5m is not None and change_5m >= settings.pump_threshold_pct:
-        return None
-
-    # Stabilizing: RSI_5m thấp + last candle green + volume_increase
-    closes_5m = [row[4] for row in mkt.ohlcv_5m]
-    last_open = mkt.ohlcv_5m[-1][1]
-    last_close = mkt.ohlcv_5m[-1][4]
-    last_candle_green = last_close > last_open
-    if not last_candle_green:
-        return None
-
-    rsi_5m = _rsi(closes_5m, settings.rsi_period)
-    if rsi_5m is None or rsi_5m > settings.rsi_reversal_threshold_5m:
-        return None
-
-    vol_5m = mkt.volumes.get(symbol_key)
-    vol_avg_1h = mkt.volumes.get(f"{symbol_key}_AVG1H")
-    if vol_5m is None or vol_avg_1h is None:
-        return None
-    volume_increase = vol_5m > vol_avg_1h
-    if not volume_increase:
-        return None
-
-    # Not near resistance: recent_high trong 3h, cần còn upside > 1%
-    lookback_bars = max(1, settings.resistance_lookback_hours * 12)
-    highs = [row[2] for row in mkt.ohlcv_5m[-lookback_bars:]]
-    if not highs:
-        return None
-    recent_high = max(highs)
-    distance_to_recent_high_pct = (recent_high - price_now) / price_now * 100.0
-    if distance_to_recent_high_pct <= settings.resistance_distance_pct_min:
-        return None
-
-    # Size & TP/SL (70% vốn mỗi lệnh)
-    c0 = settings.initial_capital_usdt
-    stake_pct = 0.70
-    size_usdt = stake_pct * c0
-    size_coin = size_usdt / price_now
-
-    tp1 = price_now * (1 + settings.tp_pct_min / 100.0)
-    tp2 = price_now * (1 + settings.tp_pct_max / 100.0)
-    sl = price_now * (1 - settings.sl_pct / 100.0)
-
-    proposal_id = f"{symbol_key}-{int(mkt.ts)}"
-    return BuyProposal(
-        id=proposal_id,
-        symbol=settings.symbol,
-        price=price_now,
-        ts=mkt.ts,
-        size_usdt=size_usdt,
-        size_coin=size_coin,
-        tp1=tp1,
-        tp2=tp2,
-        sl=sl,
-    )
+    return evaluate_entry_candidate(settings, state, mkt)
 
 
 def compute_position_pnl_pct(state: State, price_now: float) -> Optional[float]:

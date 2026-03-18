@@ -56,10 +56,22 @@ class Settings:
     # EMA50_1h: chỉ cập nhật dựa trên 1h đã đóng (handled in strategy by grouping 5m candles)
     ema_trend_period_1h: int = 50
     rsi_reversal_threshold_5m: float = 35.0
+    # Adaptive thresholds (trend strong -> relaxed RSI/dip)
+    rsi_reversal_threshold_5m_trend_strong: float = 45.0
+    dump_threshold_1h_pct_trend_strong: float = -0.5
 
     # Not near resistance: recent high trong 3h
     resistance_lookback_hours: int = 3
     resistance_distance_pct_min: float = 1.0  # >1% upside needed
+
+    # Entry scoring
+    entry_score_min: float = 2.0
+
+    # Breakout mode
+    breakout_enabled: bool = True
+    breakout_lookback_hours: int = 3
+    breakout_buffer_pct: float = 0.05
+    breakout_volume_mult: float = 1.5
 
     # Cooldown: tính từ lúc bot phát hiện SELL fill (position_closed)
     cooldown_minutes_after_close: int = 30
@@ -132,9 +144,50 @@ class Settings:
                 self.dump_threshold_pct = float(strategy.get("dump_threshold_pct"))
             except Exception:
                 pass
+        if strategy.get("dump_threshold_1h_pct") is not None:
+            try:
+                self.dump_threshold_1h_pct = float(strategy.get("dump_threshold_1h_pct"))
+            except Exception:
+                pass
         if strategy.get("pump_threshold_pct") is not None:
             try:
                 self.pump_threshold_pct = float(strategy.get("pump_threshold_pct"))
+            except Exception:
+                pass
+        if strategy.get("entry_score_min") is not None:
+            try:
+                self.entry_score_min = float(strategy.get("entry_score_min"))
+            except Exception:
+                pass
+
+        # Adaptive thresholds
+        if strategy.get("rsi_reversal_threshold_5m_trend_strong") is not None:
+            try:
+                self.rsi_reversal_threshold_5m_trend_strong = float(strategy.get("rsi_reversal_threshold_5m_trend_strong"))
+            except Exception:
+                pass
+        if strategy.get("dump_threshold_1h_pct_trend_strong") is not None:
+            try:
+                self.dump_threshold_1h_pct_trend_strong = float(strategy.get("dump_threshold_1h_pct_trend_strong"))
+            except Exception:
+                pass
+
+        # Breakout
+        if strategy.get("breakout_enabled") is not None:
+            self.breakout_enabled = bool(strategy.get("breakout_enabled"))
+        if strategy.get("breakout_lookback_hours") is not None:
+            try:
+                self.breakout_lookback_hours = int(strategy.get("breakout_lookback_hours"))
+            except Exception:
+                pass
+        if strategy.get("breakout_buffer_pct") is not None:
+            try:
+                self.breakout_buffer_pct = float(strategy.get("breakout_buffer_pct"))
+            except Exception:
+                pass
+        if strategy.get("breakout_volume_mult") is not None:
+            try:
+                self.breakout_volume_mult = float(strategy.get("breakout_volume_mult"))
             except Exception:
                 pass
 

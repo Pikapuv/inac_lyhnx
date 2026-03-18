@@ -10,8 +10,22 @@ strategy:
   poll_interval_sec: 60
   window_short_min: 5
   window_long_min: 15
-  dump_threshold_pct: -1.5
+  # Dip entry (used for scoring, not strict AND-filter)
+  dump_threshold_pct: -0.3
+  dump_threshold_1h_pct: -1.0
+  # Adaptive (trend strong -> require smaller dip, allow higher RSI)
+  dump_threshold_1h_pct_trend_strong: -0.5
+  rsi_reversal_threshold_5m_trend_strong: 45
   pump_threshold_pct: 1.5
+
+  # Entry scoring (Dip + Breakout compete; best score wins)
+  entry_score_min: 2.0
+
+  # Breakout mode
+  breakout_enabled: true
+  breakout_lookback_hours: 3
+  breakout_buffer_pct: 0.05
+  breakout_volume_mult: 1.5
 
 risk:
   capital_usdt: 20
