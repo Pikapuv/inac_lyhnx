@@ -21,6 +21,12 @@ class Settings:
     daily_limit_pct: float = 3.0
     max_trades_per_day: int = 3
 
+    # Throttling for number of BUY proposals we emit to Telegram.
+    # Since we keep only ONE risk position globally, these are not executed trades,
+    # but they should prevent spamming and "no signal for days" issues.
+    proposals_limit_global: int = 3
+    proposals_limit_per_symbol: int = 1
+
     # Theo mục tiêu "winrate cao":
     # - TP gần hơn (dễ chạm)
     # - SL rộng hơn (để tỷ lệ đạt TP cao hơn)
@@ -208,6 +214,18 @@ class Settings:
             except Exception:
                 pass
 
+        # proposal limits (throttling)
+        if strategy.get("proposals_limit_global") is not None:
+            try:
+                self.proposals_limit_global = int(strategy.get("proposals_limit_global"))
+            except Exception:
+                pass
+        if strategy.get("proposals_limit_per_symbol") is not None:
+            try:
+                self.proposals_limit_per_symbol = int(strategy.get("proposals_limit_per_symbol"))
+            except Exception:
+                pass
+
         if risk.get("max_loss_pct_per_trade") is not None:
             try:
                 self.sl_pct = float(risk.get("max_loss_pct_per_trade"))
@@ -259,6 +277,8 @@ class Settings:
             initial_capital_usdt=raw.get("initial_capital_usdt", 20.0),
             daily_limit_pct=raw.get("daily_limit_pct", 3.0),
             max_trades_per_day=raw.get("max_trades_per_day", 3),
+            proposals_limit_global=raw.get("proposals_limit_global", raw.get("max_trades_per_day", 3)),
+            proposals_limit_per_symbol=raw.get("proposals_limit_per_symbol", 1),
             tp_pct_min=raw.get("tp_pct_min", 1.8),
             tp_pct_max=raw.get("tp_pct_max", 2.5),
             sl_pct=raw.get("sl_pct", 4.0),

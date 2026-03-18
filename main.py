@@ -431,8 +431,8 @@ async def main_loop() -> None:
                 symbols = settings.effective_symbols()
                 table_rows: List[Dict[str, str]] = []
                 gstate = GlobalState.load(settings)
-                best_candidate: Dict[str, object] | None = None
                 scan_rows: List[ScanRow] = []
+                candidates: List[Dict[str, object]] = []
 
                 for sym in symbols:
                     sym_settings = Settings.from_config(cfg)
@@ -461,8 +461,6 @@ async def main_loop() -> None:
                         gated = "ENTRY_OFF"
                     elif gstate.has_position:
                         gated = "HAS_POSITION"
-                    elif gstate.pending_proposal_id:
-                        gated = "PENDING"
                     scan_rows.append(
                         ScanRow(
                             ts_utc=time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(mkt.ts)),
@@ -483,21 +481,19 @@ async def main_loop() -> None:
                         )
                     )
 
-                    # Proposal picking: only when GLOBAL entry enabled, no global position, no active pending.
-                    if (
-                        gstate.auto_trade_enabled
-                        and (not gstate.has_position)
-                        and (not gstate.pending_proposal_id)
-                    ):
+                    # Candidate picking: collect ALL symbols that meet threshold.
+                    if gstate.auto_trade_enabled and (not gstate.has_position):
                         proposal = build_buy_proposal(sym_settings, gstate, mkt)
                         if proposal:
                             score = score_buy_signal(sym_settings, mkt) or 0.0
-                            if (best_candidate is None) or (float(score) > float(best_candidate["score"])):  # type: ignore[index]
-                                best_candidate = {
-                                    "proposal": proposal,
-                                    "score": float(score),
-                                    "sym": sym,
-                                }
+                            if float(score) >= float(sym_settings.entry_score_min):
+                                candidates.append(
+                                    {
+                                        "proposal": proposal,
+                                        "score": float(score),
+                                        "sym": sym,
+                                    }
+                                )
 
                 # Position management (GLOBAL): check TP/SL/TIME + sync trades for active symbol
                 if gstate.has_position and gstate.active_symbol:
@@ -536,16 +532,58 @@ async def main_loop() -> None:
                                 gstate.time_stop_alert_sent = True
                                 gstate.save(GLOBAL_STATE_PATH)
 
-                # Emit ONLY ONE best proposal globally.
-                if best_candidate and gstate.auto_trade_enabled and (not gstate.has_position) and (not gstate.pending_proposal_id):
-                    proposal = best_candidate["proposal"]  # type: ignore[index]
-                    score = float(best_candidate["score"])  # type: ignore[index]
-                    gstate.pending_proposal_id = proposal.id
-                    gstate.pending_proposal_symbol = proposal.symbol
-                    gstate.pending_proposal_ts = time.time()
-                    gstate.save(GLOBAL_STATE_PATH)
-                    logger.info("BEST BUY proposal picked: %s score=%.4f", best_candidate.get("sym"), score)
-                    await send_buy_proposal_message(app, chat_id, proposal)  # type: ignore[arg-type]
+                # Emit multiple proposals globally (risk position vẫn giữ 1 lệnh).
+                if (
+                    gstate.auto_trade_enabled
+                    and (not gstate.has_position)
+                    and candidates
+                    and gstate.proposals_sent_today < int(settings.proposals_limit_global)
+                ):
+                    limit_global = int(settings.proposals_limit_global)
+                    limit_per_symbol = int(settings.proposals_limit_per_symbol)
+                    ttl_seconds = int(settings.proposal_ttl_seconds)
+
+                    # Send in score order: highest score first.
+                    candidates_sorted = sorted(candidates, key=lambda c: float(c["score"]), reverse=True)  # type: ignore[index]
+                    for cand in candidates_sorted:
+                        if gstate.has_position:
+                            break
+                        if gstate.proposals_sent_today >= limit_global:
+                            break
+
+                        proposal = cand["proposal"]  # type: ignore[index]
+                        sym = str(cand.get("sym") or proposal.symbol)  # type: ignore[union-attr]
+
+                        current_per_sym = int(gstate.proposals_sent_per_symbol.get(sym, 0))
+                        if current_per_sym >= limit_per_symbol:
+                            continue
+
+                        # Track "pending" for UI only; we no longer block sending on pending.
+                        gstate.pending_proposal_id = proposal.id
+                        gstate.pending_proposal_symbol = proposal.symbol
+                        gstate.pending_proposal_ts = time.time()
+                        gstate.save(GLOBAL_STATE_PATH)
+
+                        await send_buy_proposal_message(app, chat_id, proposal)  # type: ignore[arg-type]
+                        gstate.proposals_sent_today += 1
+                        gstate.proposals_sent_per_symbol[sym] = current_per_sym + 1
+                        gstate.save(GLOBAL_STATE_PATH)
+
+                        async def _expire(proposal_id: str, delay_s: int) -> None:
+                            await asyncio.sleep(delay_s)
+                            expire_pending_proposal(proposal_id)
+
+                        asyncio.create_task(_expire(proposal.id, ttl_seconds))
+
+                        logger.info(
+                            "SENT BUY proposal: %s score=%.4f (sent_today=%d/%d, per_sym=%d/%d)",
+                            sym,
+                            float(cand["score"]),  # type: ignore[index]
+                            gstate.proposals_sent_today,
+                            limit_global,
+                            gstate.proposals_sent_per_symbol.get(sym, 0),
+                            limit_per_symbol,
+                        )
 
                 # One compact table per scan cycle (all symbols)
                 if table_rows:

@@ -338,6 +338,11 @@ async def handle_buy_proposal_callback(
         st.sl_alert_sent = False
         st.time_stop_alert_sent = False
         st.trades_opened += 1
+
+        # Since we keep only ONE global position, any other pending proposals
+        # should be treated as invalid after we enter the trade.
+        PENDING_PROPOSALS.clear()
+
         # Clear global pending
         st.pending_proposal_id = None
         st.pending_proposal_symbol = None

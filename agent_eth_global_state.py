@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
@@ -55,6 +55,11 @@ class GlobalState:
 
     cooldown_until_ts: float | None = None
 
+    # Proposal sending counters (used to throttle how many BUY proposals
+    # we emit per day / per symbol).
+    proposals_sent_today: int = 0
+    proposals_sent_per_symbol: Dict[str, int] = field(default_factory=dict)
+
     @classmethod
     def new_for_day(cls, settings: Settings) -> "GlobalState":
         day = current_trading_day()
@@ -62,6 +67,8 @@ class GlobalState:
             trading_day=day,
             initial_capital_usdt=settings.initial_capital_usdt,
             daily_limit_usdt=settings.daily_limit_usdt,
+            proposals_sent_today=0,
+            proposals_sent_per_symbol={},
         )
 
     @classmethod
@@ -100,6 +107,8 @@ class GlobalState:
             daily_limit_reached=raw.get("daily_limit_reached", False),
             daily_limit_notified=raw.get("daily_limit_notified", False),
             cooldown_until_ts=raw.get("cooldown_until_ts"),
+            proposals_sent_today=raw.get("proposals_sent_today", 0),
+            proposals_sent_per_symbol=raw.get("proposals_sent_per_symbol") or {},
         )
 
         if st.trading_day != current_trading_day():
