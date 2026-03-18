@@ -355,6 +355,109 @@ def _proposal_from_price(
     )
 
 
+def scan_diagnostics(settings: Settings, mkt: MarketSnapshot) -> Dict[str, Any]:
+    """
+    Lightweight diagnostics per symbol to detect missed signals.
+    Does NOT apply risk/session gating; caller can add `gated`.
+    """
+    symbol_key = settings.symbol.replace("/", "")
+    price_now = mkt.prices.get(symbol_key)
+    if price_now is None or not mkt.ohlcv_5m:
+        return {
+            "price": price_now,
+            "chg5m": mkt.changes_5m.get(symbol_key),
+            "chg1h": mkt.changes_1h.get(symbol_key),
+            "rsi5m": None,
+            "vol_spike": None,
+            "trend_strong": None,
+            "dip_score": None,
+            "breakout_score": None,
+            "best_kind": None,
+            "best_score": None,
+            "best_reason": "",
+            "passed": False,
+        }
+
+    trend = _trend_metrics_from_ohlcv_5m(settings, mkt.ohlcv_5m, now_ts=mkt.ts, price_now=float(price_now))
+    rsi_val = _rsi_5m(settings, mkt)
+    vol_spike = _volume_spike(mkt, symbol_key)
+    change_1h = mkt.changes_1h.get(symbol_key)
+
+    last_open = mkt.ohlcv_5m[-1][1]
+    last_close = mkt.ohlcv_5m[-1][4]
+    candle_green = last_close > last_open
+
+    dip_thr_1h = settings.dump_threshold_1h_pct_trend_strong if trend["trend_strong"] else settings.dump_threshold_1h_pct
+    rsi_thr = settings.rsi_reversal_threshold_5m_trend_strong if trend["trend_strong"] else settings.rsi_reversal_threshold_5m
+
+    dip_score = 0.0
+    dip_reasons: List[str] = []
+    if (change_1h is not None) and (change_1h <= dip_thr_1h):
+        dip_score += min(3.0, abs(float(change_1h))) * 0.8
+        dip_reasons.append(f"dip_1h={change_1h:.2f}%<= {dip_thr_1h:.2f}%")
+    if (rsi_val is not None) and (rsi_val <= rsi_thr):
+        dip_score += max(0.0, (rsi_thr - float(rsi_val))) * 0.10
+        dip_reasons.append(f"rsi5m={rsi_val:.1f}<= {rsi_thr:.1f}")
+    if (vol_spike is not None) and (vol_spike >= 1.0):
+        dip_score += min(2.0, float(vol_spike)) * 0.6
+        dip_reasons.append(f"vol_spike={vol_spike:.2f}x")
+    if candle_green:
+        dip_score += 0.3
+        dip_reasons.append("candle=green")
+    if dip_score <= 0:
+        dip_score_val: float | None = None
+    else:
+        dip_score_val = float(dip_score)
+
+    breakout_score = 0.0
+    br_reasons: List[str] = []
+    if settings.breakout_enabled:
+        lookback_bars = max(1, settings.breakout_lookback_hours * 12)
+        highs = [row[2] for row in mkt.ohlcv_5m[-lookback_bars:]]
+        if len(highs) >= 2:
+            prev_high = max(highs[:-1])
+            buffer = prev_high * (1 + settings.breakout_buffer_pct / 100.0)
+            if last_close > buffer:
+                breakout_score += 2.0
+                br_reasons.append(f"break>{prev_high:.4f} (+{settings.breakout_buffer_pct:.2f}%)")
+                if vol_spike is not None and vol_spike >= settings.breakout_volume_mult:
+                    breakout_score += min(3.0, vol_spike) * 0.8
+                    br_reasons.append(f"vol_spike={vol_spike:.2f}x>= {settings.breakout_volume_mult:.2f}x")
+                if candle_green:
+                    breakout_score += 0.3
+                    br_reasons.append("candle=green")
+    breakout_score_val = float(breakout_score) if breakout_score > 0 else None
+
+    best_kind = None
+    best_score = None
+    best_reason = ""
+    if dip_score_val is not None or breakout_score_val is not None:
+        if (breakout_score_val or 0.0) >= (dip_score_val or 0.0):
+            best_kind = "BREAKOUT"
+            best_score = breakout_score_val or 0.0
+            best_reason = "; ".join(br_reasons)
+        else:
+            best_kind = "DIP"
+            best_score = dip_score_val or 0.0
+            best_reason = "; ".join(dip_reasons)
+
+    passed = bool(best_score is not None and best_score >= settings.entry_score_min and trend["trend_ok"])
+    return {
+        "price": float(price_now),
+        "chg5m": mkt.changes_5m.get(symbol_key),
+        "chg1h": mkt.changes_1h.get(symbol_key),
+        "rsi5m": float(rsi_val) if rsi_val is not None else None,
+        "vol_spike": float(vol_spike) if vol_spike is not None else None,
+        "trend_strong": bool(trend["trend_strong"]),
+        "dip_score": dip_score_val,
+        "breakout_score": breakout_score_val,
+        "best_kind": best_kind,
+        "best_score": float(best_score) if best_score is not None else None,
+        "best_reason": best_reason,
+        "passed": passed,
+    }
+
+
 def score_buy_signal(settings: Settings, mkt: MarketSnapshot) -> Optional[float]:
     """
     Higher score = better "kèo".

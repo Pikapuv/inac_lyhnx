@@ -27,6 +27,10 @@ strategy:
   breakout_buffer_pct: 0.05
   breakout_volume_mult: 1.5
 
+  # Data logging (daily sections, rolling retention)
+  data_log_path: "data.txt"
+  data_retention_days: 3
+
 risk:
   capital_usdt: 20
   position_pct: 0.25

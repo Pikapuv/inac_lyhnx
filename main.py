@@ -18,6 +18,7 @@ from agent_eth_strategy import (
     build_buy_proposal,
     check_tp_sl_time_stop,
     score_buy_signal,
+    scan_diagnostics,
 )
 from agent_eth_telegram import (
     build_application,
@@ -27,6 +28,7 @@ from agent_eth_telegram import (
 )
 from agent_eth_state import state_path_for_symbol
 from agent_eth_global_state import GLOBAL_STATE_PATH
+from data_logger import DataLogger, ScanRow
 
 
 logging.basicConfig(
@@ -380,6 +382,10 @@ async def main_loop() -> None:
 
     settings = Settings.from_config(cfg)
     app = build_application(token=token, settings=settings)
+    strategy_cfg = cfg.get("strategy") or {}
+    data_log_path = strategy_cfg.get("data_log_path") or "data.txt"
+    retention_days = int(strategy_cfg.get("data_retention_days") or 3)
+    data_logger = DataLogger(path=str(data_log_path), retention_days=retention_days)
 
     async with app:
         await app.start()
@@ -426,6 +432,7 @@ async def main_loop() -> None:
                 table_rows: List[Dict[str, str]] = []
                 gstate = GlobalState.load(settings)
                 best_candidate: Dict[str, object] | None = None
+                scan_rows: List[ScanRow] = []
 
                 for sym in symbols:
                     sym_settings = Settings.from_config(cfg)
@@ -446,6 +453,35 @@ async def main_loop() -> None:
                         }
                     )
                     # Keep per-symbol logs quiet; table summary is logged once per scan cycle.
+
+                    # data.txt diagnostics (even when gated), to evaluate "missed trades"
+                    diag = scan_diagnostics(sym_settings, mkt)
+                    gated = "OK"
+                    if not gstate.auto_trade_enabled:
+                        gated = "ENTRY_OFF"
+                    elif gstate.has_position:
+                        gated = "HAS_POSITION"
+                    elif gstate.pending_proposal_id:
+                        gated = "PENDING"
+                    scan_rows.append(
+                        ScanRow(
+                            ts_utc=time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(mkt.ts)),
+                            symbol=sym_settings.symbol,
+                            price=diag.get("price"),
+                            chg_5m=diag.get("chg5m"),
+                            chg_1h=diag.get("chg1h"),
+                            rsi_5m=diag.get("rsi5m"),
+                            vol_spike=diag.get("vol_spike"),
+                            trend_strong=diag.get("trend_strong"),
+                            dip_score=diag.get("dip_score"),
+                            breakout_score=diag.get("breakout_score"),
+                            best_kind=diag.get("best_kind"),
+                            best_score=diag.get("best_score"),
+                            passed=bool(diag.get("passed")),
+                            reason=str(diag.get("best_reason") or ""),
+                            gated=gated,
+                        )
+                    )
 
                     # Proposal picking: only when GLOBAL entry enabled, no global position, no active pending.
                     if (
@@ -514,6 +550,12 @@ async def main_loop() -> None:
                 # One compact table per scan cycle (all symbols)
                 if table_rows:
                     logger.info("Market snapshot (last scan):\n%s", _render_market_table(table_rows))
+
+                # Persist scan rows to data.txt (rolling retention by day)
+                try:
+                    data_logger.append_scan(scan_rows)
+                except Exception as e:
+                    logger.warning("data_logger append failed: %s", e)
 
                 await asyncio.sleep(poll_interval)
         finally:
