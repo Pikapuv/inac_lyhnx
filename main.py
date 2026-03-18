@@ -431,12 +431,7 @@ async def main_loop() -> None:
                             "chg1h": f"{_fmt_num(change_1h_main, digits=3)}%" if change_1h_main is not None else "n/a",
                         }
                     )
-                    logger.info(
-                        "Tick: %s price=%.4f change_5m=%s",
-                        sym_settings.symbol,
-                        price_now if price_now is not None else -1.0,
-                        f"{change_5m_main:.3f}%" if change_5m_main is not None else "n/a",
-                    )
+                    # Keep per-symbol logs quiet; table summary is logged once per scan cycle.
 
                     # Proposal picking: only when GLOBAL entry enabled, no global position, no active pending.
                     if (
