@@ -182,7 +182,12 @@ def _trend_metrics_from_ohlcv_5m(
     closes_1h = _downsample_5m_to_1h_closes(ohlcv_5m, current_ts=now_ts)
     ema50 = _ema(closes_1h, settings.ema_trend_period_1h)
     ema20 = _ema(closes_1h, 20) if len(closes_1h) >= 20 else None
-    trend_ok = (ema50 is not None) and (price_now > ema50)
+    # Warm-up: nếu chưa đủ 1h candles để tính EMA50 thì tạm cho pass,
+    # tránh trường hợp bot mới start mà mọi tín hiệu đều bị kẹt.
+    if ema50 is None:
+        trend_ok = True
+    else:
+        trend_ok = price_now > ema50
     trend_strong = False
     if ema50 is not None and ema20 is not None:
         trend_strong = price_now > ema20 > ema50

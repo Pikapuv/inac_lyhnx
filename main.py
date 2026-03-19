@@ -298,8 +298,14 @@ async def fetch_market_snapshot_from_binance(
     main_symbol_ccxt = main_symbol
     symbol_key = main_symbol.replace("/", "")
 
+    # Fetch enough 5m candles so that downsampled 1h closes can cover EMA trend.
+    # Note: downsample drops the current/incomplete 1h bucket, so add a small buffer.
+    min_limit_5m = 200
+    ema_period_1h = int(getattr(settings, "ema_trend_period_1h", 50) or 50)
+    limit_5m = max(min_limit_5m, (ema_period_1h + 2) * 12)
+
     # Fetch OHLCV for main symbol on 5m timeframe, enough for RSI / MA / candle patterns
-    ohlcv_main = _fetch_ohlcv(ex, main_symbol_ccxt, "5m", limit=200)
+    ohlcv_main = _fetch_ohlcv(ex, main_symbol_ccxt, "5m", limit=limit_5m)
     if not ohlcv_main:
         raise RuntimeError(f"Không lấy được dữ liệu OHLCV cho {main_symbol_ccxt}")
 

@@ -166,6 +166,13 @@ class Settings:
             except Exception:
                 pass
 
+        # Trend / EMA
+        if strategy.get("ema_trend_period_1h") is not None:
+            try:
+                self.ema_trend_period_1h = int(strategy.get("ema_trend_period_1h"))
+            except Exception:
+                pass
+
         # Adaptive thresholds
         if strategy.get("rsi_reversal_threshold_5m_trend_strong") is not None:
             try:
