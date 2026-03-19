@@ -120,6 +120,14 @@ async def sync_position_from_binance_trades(
     since_ts = state.last_trade_check_ts or state.position_open_time
     since_ms = int(since_ts * 1000)
 
+    logger.info(
+        "sync_position: symbol=%s position_open_time=%.0f last_trade_check_ts=%s since_ms=%d buy_trade_id=%s",
+        settings.symbol,
+        state.position_open_time,
+        state.last_trade_check_ts,
+        since_ms,
+        getattr(state, "buy_trade_id", None),
+    )
     try:
         new_trades = ex.fetch_my_trades(settings.symbol, since=since_ms)
     except Exception as e:
@@ -140,6 +148,20 @@ async def sync_position_from_binance_trades(
 
     # Sort by timestamp ascending
     new_trades = sorted(new_trades, key=lambda t: t.get("timestamp") or 0)
+    # Debug sample: show first few trades (side + timestamp) so we can see casing/format.
+    sample = [
+        {
+            "id": str(t.get("id") or ""),
+            "side": str(t.get("side") or ""),
+            "ts": int((t.get("timestamp") or 0)),
+        }
+        for t in new_trades[:3]
+    ]
+    logger.info(
+        "sync_position: fetched_trades=%d sample_first3=%s",
+        len(new_trades),
+        sample,
+    )
 
     # 1) Match BUY trade (entry)
     if state.buy_trade_id is None:
@@ -147,7 +169,8 @@ async def sync_position_from_binance_trades(
             ts_s = (tr.get("timestamp") or 0) / 1000.0
             if ts_s < (state.position_open_time or 0):
                 continue
-            if tr.get("side") != "buy":
+            side = str(tr.get("side") or "").lower()
+            if side != "buy":
                 continue
 
             state.buy_trade_id = str(tr.get("id"))
@@ -168,6 +191,13 @@ async def sync_position_from_binance_trades(
                 f"Entry: {state.entry_price:.4f} ({settings.symbol})\n"
                 f"UTC: {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(ts_s))}"
             )
+            logger.info(
+                "sync_position: matched BUY trade id=%s side=%s ts_s=%.3f price=%.8f",
+                state.buy_trade_id,
+                side,
+                ts_s,
+                state.entry_price,
+            )
             break
 
     # 2) If we have an entry buy, look for the first SELL after it
@@ -180,7 +210,8 @@ async def sync_position_from_binance_trades(
         return
 
     for tr in new_trades:
-        if tr.get("side") != "sell":
+        side = str(tr.get("side") or "").lower()
+        if side != "sell":
             continue
 
         ts_s = (tr.get("timestamp") or 0) / 1000.0

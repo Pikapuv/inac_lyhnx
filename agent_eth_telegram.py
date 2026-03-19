@@ -328,12 +328,25 @@ async def handle_buy_proposal_callback(
         if st.has_position:
             await query.edit_message_text("Bot đang có 1 vị thế mở. Không thể ENTER thêm.")
             return
+        logger.info(
+            "callback ENTER proposal_id=%s symbol=%s ts=%.0f (prev_has_position=%s, prev_buy_trade_id=%s, prev_last_trade_check_ts=%s)",
+            proposal.id,
+            proposal.symbol,
+            proposal.ts,
+            st.has_position,
+            getattr(st, "buy_trade_id", None),
+            getattr(st, "last_trade_check_ts", None),
+        )
         st.has_position = True
         st.active_symbol = proposal.symbol
         st.entry_price = proposal.price
         st.position_open_time = proposal.ts
         st.size_usdt = proposal.size_usdt
         st.size_coin = proposal.size_coin
+        # Reset tracking cursor/state for auto-sync from Binance trades.
+        # This avoids stale `buy_trade_id/last_trade_check_ts` from a previous cycle.
+        st.buy_trade_id = None
+        st.last_trade_check_ts = None
         st.tp_alert_sent = False
         st.sl_alert_sent = False
         st.time_stop_alert_sent = False
