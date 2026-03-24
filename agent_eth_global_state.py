@@ -59,6 +59,10 @@ class GlobalState:
     # we emit per day / per symbol).
     proposals_sent_today: int = 0
     proposals_sent_per_symbol: Dict[str, int] = field(default_factory=dict)
+    # Per-symbol positions (multi-position mode).
+    # key: "ETH/USDT", value: position payload.
+    positions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    trades_opened_per_symbol: Dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def new_for_day(cls, settings: Settings) -> "GlobalState":
@@ -109,6 +113,8 @@ class GlobalState:
             cooldown_until_ts=raw.get("cooldown_until_ts"),
             proposals_sent_today=raw.get("proposals_sent_today", 0),
             proposals_sent_per_symbol=raw.get("proposals_sent_per_symbol") or {},
+            positions=raw.get("positions") or {},
+            trades_opened_per_symbol=raw.get("trades_opened_per_symbol") or {},
         )
 
         if st.trading_day != current_trading_day():
@@ -117,14 +123,91 @@ class GlobalState:
             st.auto_trade_enabled = prev_entry
             st.save(path)
 
-        # Sanity: if no position, clear active_symbol
-        if not st.has_position:
+        # Backward-compatible migration: old single-position state -> positions map.
+        if (
+            not st.positions
+            and st.has_position
+            and st.active_symbol
+            and st.entry_price is not None
+        ):
+            st.positions[st.active_symbol] = {
+                "has_position": True,
+                "entry_price": st.entry_price,
+                "position_open_time": st.position_open_time,
+                "size_usdt": st.size_usdt,
+                "size_coin": st.size_coin,
+                "buy_fee_usdt": st.buy_fee_usdt,
+                "buy_trade_id": st.buy_trade_id,
+                "last_trade_check_ts": st.last_trade_check_ts,
+                "tp_alert_sent": st.tp_alert_sent,
+                "sl_alert_sent": st.sl_alert_sent,
+                "time_stop_alert_sent": st.time_stop_alert_sent,
+                "cooldown_until_ts": st.cooldown_until_ts,
+            }
+
+        # Sanity normalize for positions map.
+        normalized_positions: Dict[str, Dict[str, Any]] = {}
+        for sym, pos in (st.positions or {}).items():
+            if not sym or not isinstance(pos, dict):
+                continue
+            if not bool(pos.get("has_position")):
+                continue
+            normalized_positions[sym] = {
+                "has_position": True,
+                "entry_price": pos.get("entry_price"),
+                "position_open_time": pos.get("position_open_time"),
+                "size_usdt": pos.get("size_usdt"),
+                "size_coin": pos.get("size_coin"),
+                "buy_fee_usdt": pos.get("buy_fee_usdt"),
+                "buy_trade_id": pos.get("buy_trade_id"),
+                "last_trade_check_ts": pos.get("last_trade_check_ts"),
+                "tp_alert_sent": bool(pos.get("tp_alert_sent", False)),
+                "sl_alert_sent": bool(pos.get("sl_alert_sent", False)),
+                "time_stop_alert_sent": bool(pos.get("time_stop_alert_sent", False)),
+                "cooldown_until_ts": pos.get("cooldown_until_ts"),
+            }
+        st.positions = normalized_positions
+
+        # Keep legacy fields in sync so old code paths still work.
+        if st.positions:
+            first_symbol = next(iter(st.positions.keys()))
+            first_pos = st.positions[first_symbol]
+            st.has_position = True
+            st.active_symbol = first_symbol
+            st.entry_price = first_pos.get("entry_price")
+            st.position_open_time = first_pos.get("position_open_time")
+            st.size_usdt = first_pos.get("size_usdt")
+            st.size_coin = first_pos.get("size_coin")
+            st.buy_fee_usdt = first_pos.get("buy_fee_usdt")
+            st.buy_trade_id = first_pos.get("buy_trade_id")
+            st.last_trade_check_ts = first_pos.get("last_trade_check_ts")
+            st.tp_alert_sent = bool(first_pos.get("tp_alert_sent", False))
+            st.sl_alert_sent = bool(first_pos.get("sl_alert_sent", False))
+            st.time_stop_alert_sent = bool(first_pos.get("time_stop_alert_sent", False))
+            st.cooldown_until_ts = first_pos.get("cooldown_until_ts")
+        else:
+            st.has_position = False
             st.active_symbol = None
+            st.entry_price = None
+            st.position_open_time = None
+            st.size_usdt = None
+            st.size_coin = None
+            st.buy_fee_usdt = None
+            st.buy_trade_id = None
+            st.last_trade_check_ts = None
+            st.tp_alert_sent = False
+            st.sl_alert_sent = False
+            st.time_stop_alert_sent = False
+            st.cooldown_until_ts = None
+
         if not st.pending_proposal_id:
             st.pending_proposal_symbol = None
             st.pending_proposal_ts = None
 
         return st
+
+    def open_positions_count(self) -> int:
+        return len([1 for p in self.positions.values() if bool(p.get("has_position"))])
 
     def to_json(self) -> Dict[str, Any]:
         return asdict(self)

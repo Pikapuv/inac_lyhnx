@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import logging
 import os
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import ccxt
 import yaml
@@ -70,7 +71,6 @@ def _build_binance_exchange_config(binance_cfg: Dict[str, object]) -> Dict[str, 
             raise RuntimeError(
                 "binance_read.proxy_enabled=true nhưng thiếu binance_read.proxy_url"
             )
-        ex_cfg["httpProxy"] = proxy_url
         ex_cfg["httpsProxy"] = proxy_url
         logger.info("Binance proxy enabled via %s", proxy_url)
     else:
@@ -192,6 +192,76 @@ def _format_symbol(symbol: str) -> str:
     return symbol.replace("/", "")
 
 
+@dataclass
+class SymbolRuntimeState:
+    # Fields required by strategy/TP-SL helpers (duck-typed)
+    pnl_day_usdt: float
+    daily_limit_usdt: float
+    daily_limit_reached: bool
+    trades_opened: int
+    trades_closed: int
+    has_position: bool
+    entry_price: float | None
+    position_open_time: float | None
+    size_usdt: float | None
+    size_coin: float | None
+    buy_fee_usdt: float | None
+    buy_trade_id: str | None
+    last_trade_check_ts: float | None
+    tp_alert_sent: bool
+    sl_alert_sent: bool
+    time_stop_alert_sent: bool
+    cooldown_until_ts: float | None
+
+
+def _position_to_runtime_state(gstate: GlobalState, symbol: str) -> SymbolRuntimeState:
+    pos = gstate.positions.get(symbol) or {}
+    return SymbolRuntimeState(
+        pnl_day_usdt=gstate.pnl_day_usdt,
+        daily_limit_usdt=gstate.daily_limit_usdt,
+        daily_limit_reached=gstate.daily_limit_reached,
+        trades_opened=int(gstate.trades_opened_per_symbol.get(symbol, 0)),
+        trades_closed=int(gstate.trades_closed),
+        has_position=bool(pos.get("has_position", False)),
+        entry_price=pos.get("entry_price"),
+        position_open_time=pos.get("position_open_time"),
+        size_usdt=pos.get("size_usdt"),
+        size_coin=pos.get("size_coin"),
+        buy_fee_usdt=pos.get("buy_fee_usdt"),
+        buy_trade_id=pos.get("buy_trade_id"),
+        last_trade_check_ts=pos.get("last_trade_check_ts"),
+        tp_alert_sent=bool(pos.get("tp_alert_sent", False)),
+        sl_alert_sent=bool(pos.get("sl_alert_sent", False)),
+        time_stop_alert_sent=bool(pos.get("time_stop_alert_sent", False)),
+        cooldown_until_ts=pos.get("cooldown_until_ts"),
+    )
+
+
+def _runtime_state_to_position(gstate: GlobalState, symbol: str, st: SymbolRuntimeState) -> None:
+    if st.has_position:
+        gstate.positions[symbol] = {
+            "has_position": True,
+            "entry_price": st.entry_price,
+            "position_open_time": st.position_open_time,
+            "size_usdt": st.size_usdt,
+            "size_coin": st.size_coin,
+            "buy_fee_usdt": st.buy_fee_usdt,
+            "buy_trade_id": st.buy_trade_id,
+            "last_trade_check_ts": st.last_trade_check_ts,
+            "tp_alert_sent": st.tp_alert_sent,
+            "sl_alert_sent": st.sl_alert_sent,
+            "time_stop_alert_sent": st.time_stop_alert_sent,
+            "cooldown_until_ts": st.cooldown_until_ts,
+        }
+    else:
+        gstate.positions.pop(symbol, None)
+
+    gstate.trades_opened_per_symbol[symbol] = max(0, int(st.trades_opened))
+    gstate.trades_closed = max(int(gstate.trades_closed), int(st.trades_closed))
+    gstate.daily_limit_reached = bool(st.daily_limit_reached)
+    gstate.pnl_day_usdt = float(st.pnl_day_usdt)
+
+
 async def sync_position_from_binance_trades(
     ex: ccxt.Exchange,
     settings: Settings,
@@ -229,7 +299,7 @@ async def sync_position_from_binance_trades(
     state.last_trade_check_ts = time.time()
     if isinstance(state, GlobalState):
         state.save(GLOBAL_STATE_PATH)
-    else:
+    elif isinstance(state, State):
         state.save(state_path_for_symbol(settings.symbol))
 
     if not new_trades:
@@ -275,7 +345,7 @@ async def sync_position_from_binance_trades(
             state.size_coin = float(tr.get("amount") or 0.0)
             if isinstance(state, GlobalState):
                 state.save(GLOBAL_STATE_PATH)
-            else:
+            elif isinstance(state, State):
                 state.save(state_path_for_symbol(settings.symbol))
             await notify_message(
                 f"Đã khớp lệnh BUY trên Binance.\n"
@@ -332,7 +402,7 @@ async def sync_position_from_binance_trades(
         state.trades_closed += 1
         if isinstance(state, GlobalState):
             state.save(GLOBAL_STATE_PATH)
-        else:
+        elif isinstance(state, State):
             state.save(state_path_for_symbol(settings.symbol))
 
         logger.info("Auto-tracked CLOSE pnl_day_usdt=%.4f (pnl=%.4f)", state.pnl_day_usdt, pnl_usdt)
@@ -551,7 +621,9 @@ async def main_loop() -> None:
             while True:
                 cfg = load_config_required()
                 settings = Settings.from_config(cfg)
+                strategy_cfg = cfg.get("strategy") or {}
                 symbols = settings.effective_symbols()
+                max_open_positions = int(strategy_cfg.get("max_open_positions") or 3)
                 table_rows: List[Dict[str, str]] = []
                 gstate = GlobalState.load(settings)
                 scan_rows: List[ScanRow] = []
@@ -582,7 +654,7 @@ async def main_loop() -> None:
                     gated = "OK"
                     if not gstate.auto_trade_enabled:
                         gated = "ENTRY_OFF"
-                    elif gstate.has_position:
+                    elif bool((gstate.positions.get(sym) or {}).get("has_position")):
                         gated = "HAS_POSITION"
                     scan_rows.append(
                         ScanRow(
@@ -604,9 +676,10 @@ async def main_loop() -> None:
                         )
                     )
 
-                    # Candidate picking: collect ALL symbols that meet threshold.
-                    if gstate.auto_trade_enabled and (not gstate.has_position):
-                        proposal = build_buy_proposal(sym_settings, gstate, mkt)
+                    # Candidate picking (multi-position): evaluate per symbol state.
+                    sym_state = _position_to_runtime_state(gstate, sym)
+                    if gstate.auto_trade_enabled and gstate.open_positions_count() < max_open_positions:
+                        proposal = build_buy_proposal(sym_settings, sym_state, mkt)
                         if proposal:
                             score = score_buy_signal(sym_settings, mkt) or 0.0
                             if float(score) >= float(sym_settings.entry_score_min):
@@ -617,48 +690,53 @@ async def main_loop() -> None:
                                         "sym": sym,
                                     }
                                 )
+                        # Keep daily/risk flags in sync if strategy updated them.
+                        _runtime_state_to_position(gstate, sym, sym_state)
+                        gstate.save(GLOBAL_STATE_PATH)
 
-                # Position management (GLOBAL): check TP/SL/TIME + sync trades for active symbol
-                if gstate.has_position and gstate.active_symbol:
-                    active_settings = Settings.load()
-                    active_settings.symbol = gstate.active_symbol
+                # Position management (MULTI): sync trades + TP/SL/TIME per open symbol.
+                open_symbols = [
+                    sym for sym, pos in gstate.positions.items() if bool((pos or {}).get("has_position"))
+                ]
+                for open_sym in open_symbols:
+                    active_settings = Settings.from_config(cfg)
+                    active_settings.symbol = open_sym
+                    runtime_state = _position_to_runtime_state(gstate, open_sym)
 
                     async def notify_message(text: str) -> None:
                         await app.bot.send_message(chat_id=chat_id, text=text)
 
                     await sync_position_from_binance_trades(
-                        ex, active_settings, gstate, notify_message=notify_message
+                        ex, active_settings, runtime_state, notify_message=notify_message
                     )
-                    # Reload after possible close
-                    gstate = GlobalState.load(settings)
+                    _runtime_state_to_position(gstate, open_sym, runtime_state)
+                    gstate.save(GLOBAL_STATE_PATH)
 
-                    if gstate.has_position and gstate.active_symbol:
+                    if runtime_state.has_position:
                         mkt_active = await fetch_market_snapshot_from_binance(ex, active_settings)
                         symbol_key = active_settings.symbol.replace("/", "")
                         price_now = mkt_active.prices.get(symbol_key)
                         if price_now is not None:
-                            alerts = check_tp_sl_time_stop(active_settings, gstate, price_now, mkt_active.ts)
+                            alerts = check_tp_sl_time_stop(active_settings, runtime_state, price_now, mkt_active.ts)
                             pnl_pct = alerts.get("pnl_pct")
                             if alerts.get("tp_alert") and pnl_pct is not None:
                                 logger.info("TP alert %s at %.2f%%", active_settings.symbol, pnl_pct)
                                 await send_tp_sl_time_stop_message(app, chat_id, active_settings.symbol, "TP", pnl_pct)
-                                gstate.tp_alert_sent = True
-                                gstate.save(GLOBAL_STATE_PATH)
+                                runtime_state.tp_alert_sent = True
                             if alerts.get("sl_alert") and pnl_pct is not None:
                                 logger.info("SL alert %s at %.2f%%", active_settings.symbol, pnl_pct)
                                 await send_tp_sl_time_stop_message(app, chat_id, active_settings.symbol, "SL", pnl_pct)
-                                gstate.sl_alert_sent = True
-                                gstate.save(GLOBAL_STATE_PATH)
+                                runtime_state.sl_alert_sent = True
                             if alerts.get("time_stop_alert") and pnl_pct is not None:
                                 logger.info("TIME-STOP alert %s at %.2f%%", active_settings.symbol, pnl_pct)
                                 await send_tp_sl_time_stop_message(app, chat_id, active_settings.symbol, "TIME", pnl_pct)
-                                gstate.time_stop_alert_sent = True
-                                gstate.save(GLOBAL_STATE_PATH)
+                                runtime_state.time_stop_alert_sent = True
+                        _runtime_state_to_position(gstate, open_sym, runtime_state)
+                        gstate.save(GLOBAL_STATE_PATH)
 
-                # Emit multiple proposals globally (risk position vẫn giữ 1 lệnh).
+                # Emit multiple proposals globally + per symbol (multi-position mode).
                 if (
                     gstate.auto_trade_enabled
-                    and (not gstate.has_position)
                     and candidates
                     and gstate.proposals_sent_today < int(settings.proposals_limit_global)
                 ):
@@ -669,13 +747,15 @@ async def main_loop() -> None:
                     # Send in score order: highest score first.
                     candidates_sorted = sorted(candidates, key=lambda c: float(c["score"]), reverse=True)  # type: ignore[index]
                     for cand in candidates_sorted:
-                        if gstate.has_position:
-                            break
                         if gstate.proposals_sent_today >= limit_global:
+                            break
+                        if gstate.open_positions_count() >= max_open_positions:
                             break
 
                         proposal = cand["proposal"]  # type: ignore[index]
                         sym = str(cand.get("sym") or proposal.symbol)  # type: ignore[union-attr]
+                        if bool((gstate.positions.get(sym) or {}).get("has_position")):
+                            continue
 
                         current_per_sym = int(gstate.proposals_sent_per_symbol.get(sym, 0))
                         if current_per_sym >= limit_per_symbol:

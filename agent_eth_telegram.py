@@ -45,7 +45,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Thời gian UTC: {now_utc:%Y-%m-%d %H:%M:%S}\n"
         f"Symbols: {', '.join(settings.effective_symbols())}\n"
         f"C0: {settings.initial_capital_usdt:.2f} USDT | Daily limit: ±{settings.daily_limit_usdt:.2f}\n"
-        f"Entry: {'ON' if st.auto_trade_enabled else 'OFF'} | Pos: {'YES' if st.has_position else 'NO'}"
+        f"Entry: {'ON' if st.auto_trade_enabled else 'OFF'} | Open positions: {st.open_positions_count()}"
     )
     keyboard = [
         [
@@ -100,14 +100,14 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     st = GlobalState.load(settings)
     now_utc = datetime.now(timezone.utc)
     entry_mode = "ON" if st.auto_trade_enabled else "OFF"
-    active = st.active_symbol or "n/a"
+    active = ", ".join(sorted(st.positions.keys())) if st.positions else "n/a"
     pending = st.pending_proposal_symbol or "n/a"
     text = (
         "[agent_eth – STATUS]\n"
         f"UTC now: {now_utc:%Y-%m-%d %H:%M:%S}\n"
         f"Symbols: {', '.join(settings.effective_symbols())}\n"
         f"Entry mode: {entry_mode}\n"
-        f"Active position: {'YES' if st.has_position else 'NO'} ({active})\n"
+        f"Open positions: {st.open_positions_count()} ({active})\n"
         f"Pending proposal: {'YES' if st.pending_proposal_id else 'NO'} ({pending})\n"
         f"Daily P&L: {st.pnl_day_usdt:.4f} USDT (limit ±{st.daily_limit_usdt:.4f})\n"
         f"Trades opened/closed: {st.trades_opened}/{st.trades_closed}\n"
@@ -325,41 +325,40 @@ async def handle_buy_proposal_callback(
     st = GlobalState.load(settings)
 
     if action == "ENTER":
-        if st.has_position:
-            await query.edit_message_text("Bot đang có 1 vị thế mở. Không thể ENTER thêm.")
+        current_pos = st.positions.get(proposal.symbol) or {}
+        if bool(current_pos.get("has_position")):
+            await query.edit_message_text(f"{proposal.symbol} đang có vị thế mở. Không thể ENTER thêm.")
             return
         logger.info(
             "callback ENTER proposal_id=%s symbol=%s ts=%.0f (prev_has_position=%s, prev_buy_trade_id=%s, prev_last_trade_check_ts=%s)",
             proposal.id,
             proposal.symbol,
             proposal.ts,
-            st.has_position,
-            getattr(st, "buy_trade_id", None),
-            getattr(st, "last_trade_check_ts", None),
+            bool(current_pos.get("has_position")),
+            current_pos.get("buy_trade_id"),
+            current_pos.get("last_trade_check_ts"),
         )
-        st.has_position = True
-        st.active_symbol = proposal.symbol
-        st.entry_price = proposal.price
-        st.position_open_time = proposal.ts
-        st.size_usdt = proposal.size_usdt
-        st.size_coin = proposal.size_coin
-        # Reset tracking cursor/state for auto-sync from Binance trades.
-        # This avoids stale `buy_trade_id/last_trade_check_ts` from a previous cycle.
-        st.buy_trade_id = None
-        st.last_trade_check_ts = None
-        st.tp_alert_sent = False
-        st.sl_alert_sent = False
-        st.time_stop_alert_sent = False
+        st.positions[proposal.symbol] = {
+            "has_position": True,
+            "entry_price": proposal.price,
+            "position_open_time": proposal.ts,
+            "size_usdt": proposal.size_usdt,
+            "size_coin": proposal.size_coin,
+            "buy_fee_usdt": None,
+            "buy_trade_id": None,
+            "last_trade_check_ts": None,
+            "tp_alert_sent": False,
+            "sl_alert_sent": False,
+            "time_stop_alert_sent": False,
+            "cooldown_until_ts": None,
+        }
         st.trades_opened += 1
+        st.trades_opened_per_symbol[proposal.symbol] = int(st.trades_opened_per_symbol.get(proposal.symbol, 0)) + 1
 
-        # Since we keep only ONE global position, any other pending proposals
-        # should be treated as invalid after we enter the trade.
-        PENDING_PROPOSALS.clear()
-
-        # Clear global pending
-        st.pending_proposal_id = None
-        st.pending_proposal_symbol = None
-        st.pending_proposal_ts = None
+        if st.pending_proposal_id == proposal.id:
+            st.pending_proposal_id = None
+            st.pending_proposal_symbol = None
+            st.pending_proposal_ts = None
         st.save(GLOBAL_STATE_PATH)
 
         await query.edit_message_text(
@@ -397,7 +396,8 @@ async def handle_position_decision_callback(
     st = GlobalState.load(settings)
 
     if action in {"TP_OK", "SL_OK", "TIME_OK"}:
-        if not st.has_position or st.entry_price is None:
+        pos = st.positions.get(symbol) or {}
+        if not bool(pos.get("has_position")):
             await query.edit_message_text(
                 "Hiện tại bot không thấy còn vị thế để đóng (có thể đã được auto-tracking)."
             )

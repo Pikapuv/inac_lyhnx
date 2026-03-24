@@ -8,8 +8,10 @@ binance_read:
 strategy:
   # Backward compatible: keep `symbol` for single-coin mode.
   symbol: "ETH/USDT"
-  # Multi-coin scan: if provided, bot will scan all symbols here.
-  symbols: ["ETH/USDT", "BTC/USDT", "SOL/USDT"]
+  # Multi-coin scan (preset top 10 USDT).
+  symbols: ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT", "DOGE/USDT", "AVAX/USDT", "LINK/USDT", "DOT/USDT"]
+  # Safety: cap number of concurrently open positions.
+  max_open_positions: 3
   poll_interval_sec: 60
   window_short_min: 5
   window_long_min: 15
