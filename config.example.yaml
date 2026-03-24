@@ -1,6 +1,9 @@
 binance_read:
   apiKey: "API_KEY_READ"
   secret: "SECRET_KEY_READ"
+  # If Binance is blocked on your VPS, enable proxy routing.
+  proxy_enabled: false
+  proxy_url: "http://127.0.0.1:7890"
 
 strategy:
   # Backward compatible: keep `symbol` for single-coin mode.

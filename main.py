@@ -37,6 +37,97 @@ logging.basicConfig(
 )
 logger = logging.getLogger("agent_eth")
 
+
+def _as_bool(value: object, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    if s in {"1", "true", "yes", "on"}:
+        return True
+    if s in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _build_binance_exchange_config(binance_cfg: Dict[str, object]) -> Dict[str, object]:
+    api_key = str(binance_cfg.get("apiKey") or "")
+    secret = str(binance_cfg.get("secret") or "")
+    if not api_key or not secret:
+        raise RuntimeError("Thiếu binance_read.apiKey/secret trong config.yaml")
+
+    ex_cfg: Dict[str, object] = {
+        "apiKey": api_key,
+        "secret": secret,
+        "enableRateLimit": True,
+    }
+
+    proxy_enabled = _as_bool(binance_cfg.get("proxy_enabled"), default=False)
+    proxy_url = str(binance_cfg.get("proxy_url") or "").strip()
+    if proxy_enabled:
+        if not proxy_url:
+            raise RuntimeError(
+                "binance_read.proxy_enabled=true nhưng thiếu binance_read.proxy_url"
+            )
+        ex_cfg["httpProxy"] = proxy_url
+        ex_cfg["httpsProxy"] = proxy_url
+        logger.info("Binance proxy enabled via %s", proxy_url)
+    else:
+        logger.info("Binance proxy disabled.")
+    return ex_cfg
+
+
+def _binance_startup_healthcheck(
+    ex: ccxt.Exchange,
+    symbol: str,
+    retries: int = 5,
+    base_backoff_seconds: float = 2.0,
+) -> None:
+    """
+    Verify Binance connectivity before entering the main loop.
+    Retry with exponential backoff so transient network/proxy issues can recover.
+    """
+    attempts = max(1, int(retries))
+    for attempt in range(1, attempts + 1):
+        try:
+            server_ms = ex.fetch_time()
+            logger.info(
+                "Binance healthcheck OK (attempt=%d/%d, server_time_ms=%s)",
+                attempt,
+                attempts,
+                server_ms,
+            )
+            return
+        except Exception as e_fetch_time:
+            try:
+                ticker = ex.fetch_ticker(symbol)
+                last = ticker.get("last")
+                logger.info(
+                    "Binance healthcheck OK via fetch_ticker (attempt=%d/%d, symbol=%s, last=%s)",
+                    attempt,
+                    attempts,
+                    symbol,
+                    last,
+                )
+                return
+            except Exception as e_fetch_ticker:
+                logger.warning(
+                    "Binance healthcheck failed (attempt=%d/%d): fetch_time_err=%s; fetch_ticker_err=%s",
+                    attempt,
+                    attempts,
+                    e_fetch_time,
+                    e_fetch_ticker,
+                )
+                if attempt >= attempts:
+                    raise RuntimeError(
+                        "Không kết nối được Binance sau nhiều lần thử (kiểm tra proxy/network/api key)."
+                    ) from e_fetch_ticker
+                wait_s = base_backoff_seconds * (2 ** (attempt - 1))
+                logger.info("Retry Binance healthcheck sau %.1f giây...", wait_s)
+                time.sleep(wait_s)
+
+
 def _fmt_num(x: float | None, digits: int = 4) -> str:
     if x is None:
         return "n/a"
@@ -434,19 +525,14 @@ async def main_loop() -> None:
 
         # Khởi tạo Binance client với API key đọc từ config.yaml (binance_read)
         binance_cfg = cfg.get("binance_read") or {}
-        api_key = binance_cfg.get("apiKey") or ""
-        secret = binance_cfg.get("secret") or ""
-        if not api_key or not secret:
-            raise RuntimeError("Thiếu binance_read.apiKey/secret trong config.yaml")
-        ex = ccxt.binance(
-            {
-                "apiKey": api_key,
-                "secret": secret,
-                "enableRateLimit": True,
-            }
-        )
-        # Gửi thông báo khởi động tới chat
+        if not isinstance(binance_cfg, dict):
+            raise RuntimeError("binance_read trong config.yaml phải là object.")
+        ex_cfg = _build_binance_exchange_config(binance_cfg)
+        ex = ccxt.binance(ex_cfg)
         symbols = settings.effective_symbols()
+        health_symbol = symbols[0] if symbols else settings.symbol
+        _binance_startup_healthcheck(ex, symbol=health_symbol)
+        # Gửi thông báo khởi động tới chat
         await app.bot.send_message(
             chat_id=chat_id,
             text=(
